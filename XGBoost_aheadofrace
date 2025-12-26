@@ -1,0 +1,1130 @@
+# -*- coding: utf-8 -*-
+"""
+Predicting women's road cycling race ranks just ahead of the race with XGBoost
+8 variants:
+  (tuned/default tree) x (decay/nodecay) x (skew/noskew)
+"""
+
+# %% Imports
+
+import os
+import time
+import pickle
+from typing import Any, Dict, List, Tuple
+import numpy as np
+import pandas as pd
+
+# preprocessing and evaluation metrics packages 
+from sklearn.preprocessing import PowerTransformer
+from scipy.stats import spearmanr, skew as scipy_skew
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+
+# model packages
+import xgboost as xgb
+import optuna
+from optuna.samplers import TPESampler
+
+# For saving the eventual models
+from pathlib import Path
+from datetime import datetime
+import json
+
+# %% Configurations
+
+# reproducibility settings
+seed = 42
+num_threads = 1
+os.environ["OMP_NUM_THREADS"] = str(num_threads)
+os.environ["MKL_NUM_THREADS"] = str(num_threads)
+
+# inread of the dataset 
+dataset_xlsx = "dataset_women_prediction.xlsx"
+
+# Optuna / training
+ndcg_at = 10
+n_trials = 200
+num_boost_round = 2000
+early_stopping_rounds = 150
+final_test_year = 2024
+
+# decay cap for the "a_dlog" search bound
+max_age_cap_days = 3650 
+
+# optional SHAP-per-race
+run_shap_per_race = False
+
+# variants: 8 (lower-case)
+run_variants = {
+    # skew variants (4)
+    "xgb_tuned_decay_skew":      True,
+    "xgb_default_decay_skew":    True,
+    "xgb_tuned_nodecay_skew":    True,
+    "xgb_default_nodecay_skew":  True,
+
+    # no-skew variants (4)
+    "xgb_tuned_decay":           True,
+    "xgb_default_decay":         True,
+    "xgb_tuned_nodecay":         True,
+    "xgb_default_nodecay":       True,
+}
+
+# variant config: (tune_tree, use_decay, tune_decay, use_skew)
+variant_cfg = {
+    "xgb_tuned_decay_skew":      (True,  True,  True,  True),
+    "xgb_default_decay_skew":    (False, True,  True,  True),
+    "xgb_tuned_nodecay_skew":    (True,  False, False, True),
+    "xgb_default_nodecay_skew":  (False, False, False, True),
+
+    "xgb_tuned_decay":           (True,  True,  True,  False),
+    "xgb_default_decay":         (False, True,  True,  False),
+    "xgb_tuned_nodecay":         (True,  False, False, False),
+    "xgb_default_nodecay":       (False, False, False, False),
+}
+
+# Column names + feature list
+year_col = "year"
+query_col = "query_id"
+result_col = "result"
+name_col = "name"
+date_col = "date"
+race_profile_col = "race_profile"  # optional
+
+label_col = "rel_grade_0_31"  # we will create if missing
+
+# base feature list (must match what you used for LGBM/XGB previously)
+features_base = [
+    "age_at_race", "season_number",
+    "races_last_12_months", "num_races_last_12_months_same_profile",
+    "pcs_points_last_12_months", "avg_pcs_points_last_12_months", "std_pcs_points_last_12_months",
+    "pcs_points_last_12_months_same_profile", "avg_pcs_points_last_12_months_same_profile",
+    "std_pcs_points_last_12_months_same_profile",
+    "team_strength_12m", "team_strength_12m_same_profile",
+    "relative_team_rank", "relative_team_rank_same_profile",
+    "pcs_points_change_vs_prev_year", "pcs_points_pct_change_same_profile",
+    "pcs_points_last_6_weeks", "avg_pcs_points_last_6_weeks", "std_pcs_points_last_6_weeks",
+    "pcs_points_last_6_weeks_same_profile", "avg_pcs_points_last_6_weeks_same_profile",
+    "std_pcs_points_last_6_weeks_same_profile",
+    "continent", "birth_month",
+]
+
+# list categorical features 
+categorical_cols = ["continent", "birth_month"]
+
+# set default hyperparameters
+xgb_default_tree_params = {
+    "learning_rate": 0.3,
+    "max_depth": 6,
+    "min_child_weight": 1.0,
+    "gamma": 0.0,
+    "subsample": 1.0,
+    "colsample_bytree": 1.0,
+    "lambda": 1.0,
+    "alpha": 0.0,
+}
+
+# %% NDCG@10 calculations 
+
+def _dcg_at_k(gains: np.ndarray, k: int) -> float:
+    k = min(k, len(gains))
+    if k == 0:
+        return 0.0
+    discounts = 1.0 / np.log2(np.arange(2, k + 2))
+    return float(np.sum(gains[:k] * discounts))
+
+def ndcg_at_k_labels_scores(labels: np.ndarray, scores: np.ndarray, k: int, label_gain: np.ndarray) -> float:
+    if len(labels) == 0:
+        return 0.0
+    labels = labels.astype(int)
+    gains = label_gain[labels]
+
+    order_ideal = np.argsort(gains)[::-1]
+    idcg = _dcg_at_k(gains[order_ideal], k)
+    if idcg == 0:
+        return 0.0
+
+    order_pred = np.argsort(scores)[::-1]
+    dcg = _dcg_at_k(gains[order_pred], k)
+    return float(dcg / idcg)
+
+
+def mean_ndcg_over_queries(df_sorted: pd.DataFrame, preds: np.ndarray, k: int, label_gain: np.ndarray) -> float:
+    tmp = df_sorted[[query_col, label_col]].copy()
+    tmp["pred"] = preds
+    vals = []
+    for _, g in tmp.groupby(query_col, sort=False):
+        labels_q = g[label_col].astype(int).values
+        scores_q = g["pred"].astype(float).values
+        k_eff = min(k, len(labels_q))
+        vals.append(ndcg_at_k_labels_scores(labels_q, scores_q, k=k_eff, label_gain=label_gain))
+    return float(np.mean(vals)) if vals else 0.0
+
+
+# %% Query-age & decay weights
+
+def add_query_age_days(df_sub: pd.DataFrame, ref_date: pd.Timestamp) -> pd.DataFrame:
+    q_date = df_sub.groupby(query_col, sort=False)[date_col].max()
+    q_age = (ref_date - q_date).dt.days.clip(lower=0)
+    out = df_sub.copy()
+    out["query_age_days"] = out[query_col].map(q_age).astype(int)
+    return out
+
+
+def w_delayed_logistic_continuous(t, tau, t_knee, a, f):
+    t = np.asarray(t, dtype=float)
+    s = lambda x: 1.0 / (1.0 + np.exp((x - t_knee) / max(a, 1e-12)))
+    w = np.ones_like(t, dtype=float)
+    mask = t >= tau
+    if np.any(mask):
+        s_tau = max(s(tau), 1e-12)
+        w[mask] = f + (1.0 - f) * (s(t[mask]) / s_tau)
+    return np.clip(w, f, 1.0)
+
+
+def build_query_weights_for_trial(df_sub: pd.DataFrame, trial, max_age_cap: int) -> np.ndarray:
+    if "query_age_days" not in df_sub.columns:
+        raise KeyError("df_sub must contain 'query_age_days' before building decay weights.")
+
+    max_age_local = int(max(1, df_sub["query_age_days"].max()))
+    max_age_cap = int(max(1, max_age_cap))
+
+    f = trial.suggest_float("floor_f", 0.01, 1.0)
+    gamma_strength = trial.suggest_float("gamma_strength", 0.0, 1.0)
+
+    tau_u = trial.suggest_float("tau_u", 0.0, 1.0)
+    tau = int(np.floor(tau_u * max_age_local))
+
+    knee_rel_u = trial.suggest_float("knee_rel_u", 0.0, 1.0)
+    t_knee = tau + int(np.floor(knee_rel_u * (max_age_local - tau)))
+
+    a_low = 1.0
+    a_high = max(a_low, max_age_cap / 4.394)
+    a = trial.suggest_float("a_dlog", a_low, a_high, log=True)
+
+    t_days = df_sub["query_age_days"].values.astype(float)
+    w_decay = w_delayed_logistic_continuous(t_days, tau, t_knee, a, f)
+    w_final = (1.0 - gamma_strength) + gamma_strength * w_decay
+
+    eps = 1e-6
+    return np.clip(w_final, 1e-12, 1.0 - eps).astype(float)
+
+
+# %% Skew transformations
+
+def fit_auto_skew_transforms(
+    df_train: pd.DataFrame,
+    numeric_features: List[str],
+    categorical_features: List[str],
+    skew_threshold: float = 1.0,
+    min_rel_improve: float = 0.20,
+    min_n: int = 10,
+) -> Tuple[Dict[str, Dict[str, Any]], pd.DataFrame]:
+    """
+    Two-stage rule (UPDATED):
+      Stage 1: try log1p ONLY for features that are nonnegative in TRAIN
+               AND not in the explicit NO-LOG blacklist.
+               If log1p achieves |skew| <= threshold, pick it and stop.
+      Stage 2: otherwise, consider Yeo–Johnson and pick the best candidate overall.
+
+    NOTE: log1p_shifted has been removed to avoid invalid log domains on val/test.
+    """
+
+    # Explicit blacklist: these can be negative / unstable across years
+    NO_LOG_FEATURES = {
+        "pcs_points_change_vs_prev_year",
+        "pcs_points_pct_change_same_profile",
+        "relative_team_rank",
+        "relative_team_rank_same_profile",
+    }
+
+    cat = set(categorical_features)
+    transform_specs: Dict[str, Dict[str, Any]] = {}
+    report_rows: List[Dict[str, Any]] = []
+
+    def _to_float_arr(s: pd.Series) -> np.ndarray:
+        return pd.to_numeric(s, errors="coerce").astype(float).to_numpy()
+
+    def _sk(arr: np.ndarray) -> float:
+        x = arr[np.isfinite(arr)]
+        if x.size < min_n:
+            return np.nan
+        if np.nanstd(x) < 1e-12:
+            return 0.0
+        return float(scipy_skew(x, bias=False))
+
+    def _accept(orig_sk: float, new_sk: float) -> bool:
+        if not np.isfinite(new_sk):
+            return False
+        # accept if it crosses threshold, OR improves enough relative to original
+        if abs(new_sk) <= skew_threshold:
+            return True
+        return abs(new_sk) <= (1.0 - min_rel_improve) * abs(orig_sk)
+
+    for feat in numeric_features:
+        if feat not in df_train.columns or feat in cat:
+            continue
+
+        xv = _to_float_arr(df_train[feat])
+        orig_sk = _sk(xv)
+
+        # If already ok / not computable: keep
+        if not np.isfinite(orig_sk) or abs(orig_sk) <= skew_threshold:
+            transform_specs[feat] = {"method": "identity"}
+            report_rows.append({
+                "feature": feat, "status": "kept",
+                "orig_skew": float(orig_sk) if np.isfinite(orig_sk) else np.nan,
+                "method": "identity",
+                "new_skew": float(orig_sk) if np.isfinite(orig_sk) else np.nan,
+            })
+            continue
+
+        finite_mask = np.isfinite(xv)
+        if not finite_mask.any():
+            transform_specs[feat] = {"method": "identity"}
+            report_rows.append({
+                "feature": feat, "status": "skipped",
+                "orig_skew": float(orig_sk), "method": "identity", "new_skew": np.nan,
+            })
+            continue
+
+        min_val = float(np.nanmin(xv[finite_mask]))
+
+        # Stage 1: log1p ONLY (no shift)
+        log_evals: List[Tuple[str, Dict[str, Any], float]] = []
+
+        can_try_log = (min_val >= 0.0) and (feat not in NO_LOG_FEATURES)
+        if can_try_log:
+            x_log = np.full_like(xv, np.nan, dtype=float)
+            x_log[finite_mask] = np.log1p(xv[finite_mask])
+            sk_log = _sk(x_log)
+            if np.isfinite(sk_log):
+                log_evals.append(("log1p", {}, float(sk_log)))
+
+        # pick best log (smallest |skew|)
+        best_log = None
+        if log_evals:
+            best_log = min(log_evals, key=lambda t: abs(t[2]))  # (method, params, new_skew)
+
+        # If log reaches the threshold, choose log and do NOT consider YJ
+        log_good = [t for t in log_evals if abs(t[2]) <= skew_threshold]
+        if log_good:
+            method, params, new_sk = min(log_good, key=lambda t: abs(t[2]))
+            best = {"method": method, "params": params, "new_skew": float(new_sk)}
+        else:
+            # Stage 2: consider Yeo–Johnson
+            best = None
+            yj_eval = None
+            try:
+                pt = PowerTransformer(method="yeo-johnson", standardize=False)
+                z = pt.fit_transform(xv[finite_mask].reshape(-1, 1)).ravel()
+                z_full = np.full_like(xv, np.nan, dtype=float)
+                z_full[finite_mask] = z
+                yj_sk = _sk(z_full)
+                if np.isfinite(yj_sk):
+                    yj_eval = ("yeojohnson", {"pt": pt}, float(yj_sk))
+            except Exception:
+                yj_eval = None
+
+            # compare best available log (even if still > threshold) vs YJ
+            candidates = []
+            if best_log is not None:
+                candidates.append(best_log)
+            if yj_eval is not None:
+                candidates.append(yj_eval)
+
+            if candidates:
+                method, params, new_sk = min(candidates, key=lambda t: abs(t[2]))
+                best = {"method": method, "params": params, "new_skew": float(new_sk)}
+
+        # Decide accept vs keep original
+        if best is None or (not _accept(orig_sk, best["new_skew"])):
+            transform_specs[feat] = {"method": "identity"}
+            report_rows.append({
+                "feature": feat, "status": "kept",
+                "orig_skew": float(orig_sk), "method": "identity", "new_skew": float(orig_sk),
+            })
+        else:
+            transform_specs[feat] = {"method": best["method"], **best["params"]}
+            report_rows.append({
+                "feature": feat, "status": "transformed",
+                "orig_skew": float(orig_sk),
+                "method": best["method"],
+                "new_skew": float(best["new_skew"]),
+            })
+
+    report = (
+        pd.DataFrame(report_rows)
+          .sort_values(["status", "feature"])
+          .reset_index(drop=True)
+    )
+    return transform_specs, report
+
+
+def apply_auto_skew_transforms(
+    df: pd.DataFrame,
+    features_base: List[str],
+    categorical_features: List[str],
+    transform_specs: Dict[str, Dict[str, Any]],
+) -> Tuple[pd.DataFrame, List[str]]:
+
+    cat = set(categorical_features)
+    df_out = df.copy()
+    used_features: List[str] = []
+
+    for feat in features_base:
+        if feat not in df_out.columns:
+            continue
+
+        if feat in cat:
+            used_features.append(feat)
+            continue
+
+        spec = transform_specs.get(feat, {"method": "identity"})
+        method = spec.get("method", "identity")
+
+        x = pd.to_numeric(df_out[feat], errors="coerce").astype(float)
+        arr = x.to_numpy()
+        m = np.isfinite(arr)
+        arr_new = arr.copy()
+
+        if method == "log1p":
+            # Guard log1p domain: requires x > -1
+            z = arr[m].copy()
+            z[z <= -1.0] = np.nan
+            arr_new[m] = np.log1p(z)
+
+        elif method == "yeojohnson":
+            pt = spec.get("pt", None)
+            if pt is not None and m.any():
+                arr_new[m] = pt.transform(arr[m].reshape(-1, 1)).ravel()
+
+        # identity does nothing
+        df_out[feat] = pd.Series(arr_new, index=df_out.index)
+        used_features.append(feat)
+
+    return df_out, used_features
+
+
+# %% DMatrix builder for ranking
+
+def _sort_for_groups(df_in: pd.DataFrame) -> pd.DataFrame:
+    # stable sort keeps relative order
+    return df_in.sort_values([query_col], kind="mergesort")
+
+
+def make_rank_dmatrix(
+    df_in: pd.DataFrame,
+    feature_cols: List[str],
+    label_name: str,
+    row_weights: np.ndarray | None,
+):
+    df_sorted = _sort_for_groups(df_in)
+
+    X = df_sorted[feature_cols].copy()
+    for c in categorical_cols:
+        if c in X.columns:
+            X[c] = X[c].astype("category")
+
+    y = df_sorted[label_name].astype(float).values
+    dmat = xgb.DMatrix(X, label=y, enable_categorical=True)
+
+    group_sizes = df_sorted.groupby(query_col, sort=False).size().tolist()
+    dmat.set_group(group_sizes)
+
+    if row_weights is not None:
+        w = pd.Series(np.asarray(row_weights, dtype=float), index=df_in.index)
+        w_sorted = w.reindex(df_sorted.index).to_numpy()
+
+        if np.isnan(w_sorted).any():
+            raise ValueError("Weights reindexing produced NaNs (index mismatch).")
+        if not np.isfinite(w_sorted).all():
+            raise ValueError("Weights contain inf/-inf.")
+        if (w_sorted <= 0).any():
+            raise ValueError("Weights must be strictly positive.")
+
+        # convert row weights -> per-group weights (one per query)
+        w_group = (
+            pd.Series(w_sorted, index=df_sorted.index)
+              .groupby(df_sorted[query_col], sort=False)
+              .mean()
+              .to_numpy()
+        )
+        w_group = w_group / max(1e-12, float(np.mean(w_group)))  # mean if fine considering that rows within a query all get the same weight - see function add_query_age_days
+
+        if len(w_group) != len(group_sizes):
+            raise ValueError("Group weight length mismatch.")
+        dmat.set_weight(w_group.astype(float))
+
+    return dmat, df_sorted
+
+# %% SHAP values per race
+
+def compute_xgb_contribs(
+    booster: xgb.Booster,
+    X: pd.DataFrame,
+    df_meta: pd.DataFrame,                 # must include query_col and pred_col, same index as X
+    feature_names: list[str],
+    query_col: str,
+    categorical_cols: list[str] = (),
+    pred_col: str = "pred",
+):
+    # Align rows by index (important!)
+    X_use = X.loc[df_meta.index, feature_names].copy()
+    for c in categorical_cols:
+        if c in X_use.columns:
+            X_use[c] = X_use[c].astype("category")
+
+    dmat = xgb.DMatrix(X_use, enable_categorical=True)
+
+    t0 = time.perf_counter()
+    contrib = np.asarray(booster.predict(dmat, pred_contribs=True))
+    shap_time_seconds = float(time.perf_counter() - t0)
+
+    # Expect bias term as last column
+    if contrib.shape[1] != len(feature_names) + 1:
+        raise ValueError(f"Unexpected contrib shape {contrib.shape}; expected (n, {len(feature_names)+1}).")
+
+    bias = contrib[:, -1]
+    shap_vals = contrib[:, :-1]  # SHAP values per feature
+
+    df_shap = pd.DataFrame(shap_vals, index=X_use.index, columns=feature_names)
+    df_shap[query_col] = df_meta.loc[X_use.index, query_col].values
+    df_shap[pred_col]  = df_meta.loc[X_use.index, pred_col].values
+
+    return df_shap, bias, shap_time_seconds, X_use
+
+
+def summarize_shap_topk_and_all(
+    df_shap: pd.DataFrame,
+    feature_names: list[str],
+    query_col: str,
+    pred_col: str,
+    k: int = 10,
+    prefix_all: str = "shap_all_",
+    prefix_top: str = "shap_top10_",
+):
+    # select top-k rows per query by prediction
+    top_idx = (
+        df_shap[[query_col, pred_col]]
+        .groupby(query_col, sort=False)[pred_col]
+        .nlargest(k)
+        .index.get_level_values(1)
+    )
+    df_top = df_shap.loc[top_idx]
+
+    # per-query (race) mean |SHAP|
+    race_all = (
+        df_shap.set_index(query_col)[feature_names]
+        .abs().groupby(level=0).mean()
+        .rename(columns={f: f"{prefix_all}{f}" for f in feature_names})
+        .reset_index()
+    )
+    race_top = (
+        df_top.set_index(query_col)[feature_names]
+        .abs().groupby(level=0).mean()
+        .rename(columns={f: f"{prefix_top}{f}" for f in feature_names})
+        .reset_index()
+    )
+
+    # global (overall) mean |SHAP| across rows
+    global_all = (
+        df_shap[feature_names].abs().mean()
+        .sort_values(ascending=False)
+        .rename("mean_abs_shap_all")
+        .reset_index()
+        .rename(columns={"index": "feature"})
+    )
+    global_top = (
+        df_top[feature_names].abs().mean()
+        .sort_values(ascending=False)
+        .rename(f"mean_abs_shap_top{k}")
+        .reset_index()
+        .rename(columns={"index": "feature"})
+    )
+
+    return {
+        "race_all": race_all,
+        "race_topk": race_top,
+        "global_all": global_all,
+        "global_topk": global_top,
+        "topk_index": df_top.index,
+    }
+
+# %% Evaluation on 2024
+
+def evaluate_on_2024(df_test_with_pred: pd.DataFrame, pred_col: str, k_top: int = 10):
+    df_eval = df_test_with_pred.copy()
+
+    df_eval["actual_rank"] = df_eval.groupby(query_col)[result_col].rank(method="min", ascending=True)
+    df_eval["predicted_rank"] = df_eval.groupby(query_col)[pred_col].rank(method="first", ascending=False)
+
+    summary_rows = []
+    for qid, g in df_eval.groupby(query_col, sort=False):
+        g = g.copy()
+        n_riders = len(g)
+
+        g_actual = g.sort_values(result_col, ascending=True)
+        g_pred = g.sort_values(pred_col, ascending=False)
+
+        k_eff = min(k_top, n_riders)
+
+        actual_names = g_actual[name_col].tolist()[:k_eff]
+        pred_names = g_pred[name_col].tolist()[:k_eff]
+
+        row = {"query_id": qid, "n_riders": n_riders}
+        if race_profile_col in g.columns:
+            row[race_profile_col] = g[race_profile_col].iloc[0]
+
+        for i in range(k_top):
+            row[f"actual_rank_{i+1}"] = actual_names[i] if i < len(actual_names) else np.nan
+            row[f"pred_rank_{i+1}"] = pred_names[i] if i < len(pred_names) else np.nan
+
+        if n_riders > 1:
+            # Focus set: PREDICTED top-k riders only
+            focus_idx = g_pred.index[:k_eff]
+            g_focus = g.loc[focus_idx]
+
+            # Graded relevance (MATCHES TRAINING/CV) for NDCG@k
+            labels_q = g[label_col].astype(int).values          # rel_grade_0_31
+            scores_q = g[pred_col].astype(float).values
+
+            row["ndcg@10"] = ndcg_at_k_labels_scores(
+                labels_q, scores_q, k=k_eff, label_gain=label_gain
+            )
+
+            # Spearman/MAE/RMSE on PREDICTED top-k riders only
+            if g_focus["predicted_rank"].nunique() > 1 and g_focus["actual_rank"].nunique() > 1:
+                rho = spearmanr(g_focus["predicted_rank"], g_focus["actual_rank"]).correlation
+                row["spearman_rho"] = float(rho) if np.isfinite(rho) else np.nan
+            else:
+                row["spearman_rho"] = np.nan
+
+            row["mae_rank"] = float(mean_absolute_error(g_focus["actual_rank"], g_focus["predicted_rank"]))
+            row["rmse_rank"] = float(np.sqrt(mean_squared_error(g_focus["actual_rank"], g_focus["predicted_rank"])))
+
+            # Top-3 accuracy (podium overlap proportion) 
+            k3 = 3
+            if n_riders >= k3:
+                true_top3_idx = set(g_actual.index[:k3])
+                pred_top3_idx = set(g_pred.index[:k3])
+                row["top3_accuracy"] = len(true_top3_idx & pred_top3_idx) / k3
+            else:
+                row["top3_accuracy"] = np.nan
+
+            # Precision@10 overlap
+            true_top_idx = set(g_actual.index[:k_eff])
+            pred_top_idx = set(g_pred.index[:k_eff])
+            row["precision@10"] = len(true_top_idx & pred_top_idx) / k_eff
+        else:
+            row["ndcg@10"] = np.nan
+            row["spearman_rho"] = np.nan
+            row["mae_rank"] = np.nan
+            row["top3_accuracy"] = np.nan
+            row["precision@10"] = np.nan
+            row["rmse_rank"] = np.nan
+
+        summary_rows.append(row)
+
+    df_summary = pd.DataFrame(summary_rows)
+
+    metrics = {
+        "mean_ndcg@10": float(df_summary["ndcg@10"].mean(skipna=True)),
+        "mean_spearman_rho": float(df_summary["spearman_rho"].mean(skipna=True)),
+        "mean_mae_rank": float(df_summary["mae_rank"].mean(skipna=True)),
+        "mean_top3_accuracy": float(df_summary["top3_accuracy"].mean(skipna=True)),
+        "mean_precision@10": float(df_summary["precision@10"].mean(skipna=True)),
+        "mean_rmse_rank": float(df_summary["rmse_rank"].mean(skipna=True)),
+    }
+
+    return df_summary, metrics
+
+
+# %% Timer
+
+def time_prediction_xgb(booster: xgb.Booster, X_test: pd.DataFrame, df_test_template: pd.DataFrame, pred_col: str):
+    dtest = xgb.DMatrix(X_test, enable_categorical=True)
+    t0 = time.perf_counter()
+    preds = booster.predict(dtest)
+    t1 = time.perf_counter()
+
+    df_out = df_test_template.copy()
+    df_out[pred_col] = preds
+
+    pred_time_seconds = float(t1 - t0)
+    n_races = int(df_out[query_col].nunique())
+    n_riders = int(len(df_out))
+
+    return df_out, pred_time_seconds, n_races, n_riders
+
+# %% Optuna CV tuner
+
+def tune_xgb_cv(
+    df_all: pd.DataFrame,
+    folds: List[Dict[str, Any]],
+    tune_tree: bool,
+    use_decay: bool,
+    tune_decay: bool,
+    use_skew: bool,
+    ndcg_at: int,
+    n_trials: int,
+    seed: int,
+):
+    # Precompute per-fold splits + (optional) skew transforms ONCE
+    fold_cache: List[Dict[str, Any]] = []
+
+    for fold in folds:
+        fold_name = fold.get("name", f"val_{fold['val_year']}")
+        val_year = int(fold["val_year"])
+
+        df_train = df_all.loc[df_all[year_col].isin(fold["train_years"])].copy()
+        df_val   = df_all.loc[df_all[year_col] == val_year].copy()
+
+        # query age days per subset (NOT trial-dependent)
+        ref_train = df_train[date_col].max()
+        ref_val   = df_val[date_col].max()
+        df_train  = add_query_age_days(df_train, ref_train)
+        df_val    = add_query_age_days(df_val,   ref_val)
+
+        # skew preprocessing (NOT trial-dependent)
+        if use_skew:
+            numeric_feats = [c for c in features_base if c in df_train.columns and c not in categorical_cols]
+            transform_specs, _ = fit_auto_skew_transforms(
+                df_train,
+                numeric_features=numeric_feats,
+                categorical_features=categorical_cols,
+            )
+            df_train_tr, used_feats = apply_auto_skew_transforms(df_train, features_base, categorical_cols, transform_specs)
+            df_val_tr, _            = apply_auto_skew_transforms(df_val,   features_base, categorical_cols, transform_specs)
+
+            # be robust if a column is missing in val
+            feature_cols = [c for c in used_feats if (c in df_train_tr.columns and c in df_val_tr.columns)]
+        else:
+            df_train_tr = df_train
+            df_val_tr   = df_val
+            feature_cols = [c for c in features_base if (c in df_train_tr.columns and c in df_val_tr.columns)]
+
+        # keep category dtype
+        for c in categorical_cols:
+            if c in df_train_tr.columns:
+                df_train_tr[c] = df_train_tr[c].astype("category")
+            if c in df_val_tr.columns:
+                df_val_tr[c] = df_val_tr[c].astype("category")
+
+        # sort once (NOT trial-dependent)
+        df_train_sorted = _sort_for_groups(df_train_tr)
+        df_val_sorted   = _sort_for_groups(df_val_tr)
+
+        # build X/y once (NOT trial-dependent)
+        X_train = df_train_sorted[feature_cols].copy()
+        X_val   = df_val_sorted[feature_cols].copy()
+        for c in categorical_cols:
+            if c in X_train.columns:
+                X_train[c] = X_train[c].astype("category")
+            if c in X_val.columns:
+                X_val[c] = X_val[c].astype("category")
+
+        y_train = df_train_sorted[label_col].astype(float).values
+        y_val   = df_val_sorted[label_col].astype(float).values
+
+        group_train = df_train_sorted.groupby(query_col, sort=False).size().tolist()
+        group_val   = df_val_sorted.groupby(query_col, sort=False).size().tolist()
+
+        fold_cache.append({
+            "name": fold_name,
+            "val_year": val_year,
+            "df_train_sorted": df_train_sorted,   # used for decay weights (needs query_age_days)
+            "df_val_sorted": df_val_sorted,       # used for decay weights + eval
+            "X_train": X_train,
+            "y_train": y_train,
+            "group_train": group_train,
+            "X_val": X_val,
+            "y_val": y_val,
+            "group_val": group_val,
+        })
+
+    # helper: row-weights -> group-weights (same logic as make_rank_dmatrix)
+    def _set_group_weights(dmat: xgb.DMatrix, df_sorted: pd.DataFrame, w_row: np.ndarray):
+        w_group = (
+            pd.Series(np.asarray(w_row, dtype=float), index=df_sorted.index)
+              .groupby(df_sorted[query_col], sort=False)
+              .mean()
+              .to_numpy()
+        )
+        w_group = w_group / max(1e-12, float(np.mean(w_group)))
+        dmat.set_weight(w_group.astype(float))
+
+    # Optuna objective (trial-dependent only)
+    def objective(trial: optuna.Trial) -> float:
+        # tree params
+        if tune_tree:
+            # --- matches your thesis table ranges ---
+            tree_params = {
+                # Eta (learning rate): [0.01, 0.3]
+                "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.30, log=True),
+                # Max_depth: [3, 10]
+                "max_depth": trial.suggest_int("max_depth", 3, 10),
+                # min_child_weight: [1, 30]
+                "min_child_weight": trial.suggest_float("min_child_weight", 1.0, 30.0, log=True),
+                # Gamma: [0, 5]
+                # NOTE: can't do log=True with 0, so use uniform sampling
+                "gamma": trial.suggest_float("gamma", 0.0, 5.0),
+                # subsample: [0.5, 1.0]
+                "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+                # colsample_bytree: [0.5, 1.0]
+                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+                # Lambda (L2): [0.01, 1]
+                # log=True is fine here because lower bound > 0
+                "lambda": trial.suggest_float("lambda", 0.01, 1.0, log=True),
+                # alpha (L1): [0, 10]
+                # NOTE: can't do log=True with 0, so use uniform sampling
+                "alpha": trial.suggest_float("alpha", 0.0, 10.0),
+            }
+
+        else:
+            tree_params = dict(xgb_default_tree_params)
+
+        params = {
+            **tree_params,
+            "objective": "rank:ndcg",
+            "eval_metric": f"ndcg@{ndcg_at}",
+            "seed": seed,
+            "tree_method": "hist",
+            "nthread": num_threads,
+        }
+
+        fold_scores = []
+        fold_scores_by_name = {}
+        fold_year_by_name = {}
+        fold_best_iter_by_name = {}
+
+        for fc in fold_cache:
+            # decay weights (trial-dependent only)
+            if use_decay and tune_decay:
+                w_train = build_query_weights_for_trial(fc["df_train_sorted"], trial, max_age_cap=max_age_cap_days)
+                w_val = None
+            elif use_decay and (not tune_decay):
+                class FixedTrial:
+                    def suggest_float(self, name, *args, **kwargs):
+                        fixed = {
+                            "floor_f": 0.20,
+                            "gamma_strength": 0.50,
+                            "tau_u": 0.10,
+                            "knee_rel_u": 0.50,
+                            "a_dlog": 50.0,
+                        }
+                        return float(fixed[name])
+
+                w_train = build_query_weights_for_trial(fc["df_train_sorted"], FixedTrial(), max_age_cap=max_age_cap_days)
+                w_val = None
+            else:
+                w_train = None
+                w_val = None
+
+            # build DMatrix (trial-dependent because weights vary)
+            dtrain = xgb.DMatrix(fc["X_train"], label=fc["y_train"], enable_categorical=True)
+            dtrain.set_group(fc["group_train"])
+            if w_train is not None:
+                _set_group_weights(dtrain, fc["df_train_sorted"], w_train)
+
+            dval = xgb.DMatrix(fc["X_val"], label=fc["y_val"], enable_categorical=True)
+            dval.set_group(fc["group_val"])
+            if w_val is not None:
+                _set_group_weights(dval, fc["df_val_sorted"], w_val)
+
+            booster = xgb.train(
+                params,
+                dtrain,
+                num_boost_round=num_boost_round,
+                evals=[(dval, "val")],
+                early_stopping_rounds=early_stopping_rounds,
+                verbose_eval=False,
+            )
+
+            best_iter = int((booster.best_iteration if booster.best_iteration is not None else (num_boost_round - 1)) + 1)
+
+            preds = booster.predict(dval, iteration_range=(0, best_iter))
+            score = mean_ndcg_over_queries(fc["df_val_sorted"], preds, ndcg_at, label_gain)
+
+            fold_scores.append(score)
+            fold_scores_by_name[fc["name"]] = float(score)
+            fold_year_by_name[fc["name"]] = int(fc["val_year"])
+            fold_best_iter_by_name[fc["name"]] = int(best_iter)
+
+        # choose fold with best NDCG; tie-break by later val_year
+        best_fold = max(
+            fold_scores_by_name.keys(),
+            key=lambda fn: (fold_scores_by_name[fn], fold_year_by_name.get(fn, -1)),
+        )
+        selected_best_iter = int(fold_best_iter_by_name[best_fold])
+
+        trial.set_user_attr("fold_ndcg", fold_scores_by_name)
+        trial.set_user_attr("fold_val_year", fold_year_by_name)
+        trial.set_user_attr("fold_best_iter", fold_best_iter_by_name)
+        trial.set_user_attr("selected_fold", best_fold)
+        trial.set_user_attr("selected_best_iter", selected_best_iter)
+
+        # keep name so the rest of your pipeline stays unchanged
+        trial.set_user_attr("mean_best_iter", selected_best_iter)
+
+        return float(np.mean(fold_scores))
+
+    study = optuna.create_study(direction="maximize", sampler=TPESampler(seed=seed, multivariate=True))
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+
+    best_params = dict(study.best_trial.params)
+    mean_best_iter = int(study.best_trial.user_attrs["mean_best_iter"])
+    return study, best_params, mean_best_iter
+
+# %% Load data & build labels
+
+df = pd.read_excel(dataset_xlsx).copy()
+
+required_cols = {year_col, query_col, result_col, date_col, name_col}
+missing = sorted(required_cols - set(df.columns))
+if missing:
+    raise ValueError(f"Dataset missing required columns: {missing}")
+
+# keep numeric results only
+df = df[pd.to_numeric(df[result_col], errors="coerce").notna()].copy()
+df[result_col] = df[result_col].astype(int)
+
+# date parsing + stable sort
+df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+df = df.sort_values([query_col, date_col]).reset_index(drop=True)
+
+# label engineering if needed
+if label_col not in df.columns:
+    df["group_size"] = df.groupby(query_col, sort=False)[result_col].transform("count")
+    df["relevance"] = (df["group_size"] + 1 - df[result_col]).clip(lower=1).astype(float)
+    den = (df["group_size"] - 1).replace(0, 1)
+    df[label_col] = np.floor((df["relevance"] - 1) * 31 / den).astype(int)
+
+df[label_col] = df[label_col].astype(int)
+
+# categorical dtype
+for c in categorical_cols:
+    if c in df.columns:
+        df[c] = df[c].astype("category")
+
+# label gains
+max_label = int(df[label_col].max())
+label_gain = np.array([2**i - 1 for i in range(max_label + 1)], dtype=float)
+
+# folds (time-series)
+folds = [
+    {"name": "fold1", "train_years": [2019, 2020],             "val_year": 2021},
+    {"name": "fold2", "train_years": [2019, 2020, 2021],       "val_year": 2022},
+    {"name": "fold3", "train_years": [2019, 2020, 2021, 2022], "val_year": 2023},
+]
+
+# final split
+train_years_final = sorted(y for y in df[year_col].unique() if y < final_test_year)
+df_train_final = df.loc[df[year_col].isin(train_years_final)].copy()
+df_test_final = df.loc[df[year_col] == final_test_year].copy()
+
+# query age for final sets (used only if decay is on)
+df_train_final = add_query_age_days(df_train_final, df_train_final[date_col].max())
+df_test_final = add_query_age_days(df_test_final, df_test_final[date_col].max())
+
+# %% Run variants
+rows = []
+all_skew_reports = []
+
+all_shap_global_all = {}
+all_shap_global_top10 = {}
+
+for variant_name, do_run in run_variants.items():
+    if not do_run:
+        continue
+
+    transform_specs_final = None  # reset per-variant (so nothing “leaks” from a previous run)
+
+    tune_tree, use_decay, tune_decay, use_skew = variant_cfg[variant_name]
+    print("\n" + "="*80)
+    print(f"RUNNING: {variant_name}")
+    print(f"  tune_tree={tune_tree}, use_decay={use_decay}, tune_decay={tune_decay}, use_skew={use_skew}")
+
+    # CV tuning (or none) 
+    # CV for ALL variants (tree count via early stopping) 
+    # For tuned variants: full Optuna. For default variants: 1 trial is enough (params fixed).
+    fold_ndcg_best = {}
+    n_trials_run = n_trials if (tune_tree or tune_decay) else 1   # no need to run optuna tuning for defaul, no decay
+
+    study, best_params, mean_best_iter = tune_xgb_cv(
+        df_all=df,
+        folds=folds,
+        tune_tree=tune_tree,
+        use_decay=use_decay,
+        tune_decay=tune_decay,
+        use_skew=use_skew,
+        ndcg_at=ndcg_at,
+        n_trials=n_trials_run,
+        seed=seed,
+    )
+    cv_best = float(study.best_value)
+    fold_ndcg_best = study.best_trial.user_attrs.get("fold_ndcg", {}) or {}
+
+    # tree params for final training
+    if tune_tree:
+        tree_params_final = {k: best_params[k] for k in xgb_default_tree_params.keys() if k in best_params}
+        for k, v in xgb_default_tree_params.items():
+            tree_params_final.setdefault(k, v)
+    else:
+        tree_params_final = dict(xgb_default_tree_params)
+
+    # decay params (only if use_decay)
+    decay_keys = ["floor_f", "gamma_strength", "tau_u", "knee_rel_u", "a_dlog"]
+    decay_params_final = {k: best_params[k] for k in decay_keys if k in best_params} if (use_decay and tune_decay) else {}
+
+    # number of trees (use CV-derived mean_best_iter for ALL variants)
+    if np.isfinite(mean_best_iter) and mean_best_iter > 0:
+        num_trees_final = int(mean_best_iter)
+    else:
+        num_trees_final = 500  # safety fallback
+
+    # skew transform specs for final train/test (fit on train only) 
+    if use_skew:
+        numeric_feats = [c for c in features_base if c in df_train_final.columns and c not in categorical_cols]
+        transform_specs_final, skew_report_final = fit_auto_skew_transforms(
+            df_train_final,
+            numeric_features=numeric_feats,
+            categorical_features=categorical_cols,
+        )
+        skew_report_final["variant"] = variant_name
+        all_skew_reports.append(skew_report_final)
+
+        df_train_tr, used_feats = apply_auto_skew_transforms(df_train_final, features_base, categorical_cols, transform_specs_final)
+        df_test_tr, _ = apply_auto_skew_transforms(df_test_final, features_base, categorical_cols, transform_specs_final)
+        feature_cols = [c for c in used_feats if c in df_train_tr.columns]
+    else:
+        df_train_tr = df_train_final.copy()
+        df_test_tr = df_test_final.copy()
+        feature_cols = [c for c in features_base if c in df_train_tr.columns]
+
+    # keep category dtype
+    for c in categorical_cols:
+        if c in df_train_tr.columns:
+            df_train_tr[c] = df_train_tr[c].astype("category")
+        if c in df_test_tr.columns:
+            df_test_tr[c] = df_test_tr[c].astype("category")
+
+    # build final training DMatrix (ranking groups contiguous) 
+    df_train_sorted = _sort_for_groups(df_train_tr)
+    X_train_sorted = df_train_sorted[feature_cols].copy()
+    for c in categorical_cols:
+        if c in X_train_sorted.columns:
+            X_train_sorted[c] = X_train_sorted[c].astype("category")
+
+    y_train_sorted = df_train_sorted[label_col].astype(float).values
+
+    dtrain_final = xgb.DMatrix(X_train_sorted, label=y_train_sorted, enable_categorical=True)
+    group_sizes = df_train_sorted.groupby(query_col, sort=False).size().tolist()
+    dtrain_final.set_group(group_sizes)
+
+    # group weights (only for decay)
+    if use_decay:
+        class DummyTrial:
+            def __init__(self, p): self.p = p
+            def suggest_float(self, name, *args, **kwargs): return float(self.p[name])
+
+        if tune_decay:
+            decay_use = decay_params_final
+        else:
+            decay_use = {"floor_f": 0.20, "gamma_strength": 0.50, "tau_u": 0.10, "knee_rel_u": 0.50, "a_dlog": 50.0}
+
+        w_row = build_query_weights_for_trial(df_train_sorted, DummyTrial(decay_use), max_age_cap=max_age_cap_days)
+
+        w_group = (
+            pd.Series(w_row, index=df_train_sorted.index)
+              .groupby(df_train_sorted[query_col], sort=False)
+              .mean()
+              .to_numpy()
+        )
+        w_group = w_group / max(1e-12, float(np.mean(w_group)))
+        dtrain_final.set_weight(w_group.astype(float))
+
+    # final train 
+    params_final = {
+        **tree_params_final,
+        "objective": "rank:ndcg",
+        "eval_metric": f"ndcg@{ndcg_at}",
+        "seed": seed,
+        "tree_method": "hist",
+        "nthread": num_threads,
+    }
+
+    t0 = time.perf_counter()
+    model = xgb.train(params_final, dtrain_final, num_boost_round=num_trees_final, verbose_eval=False)
+    t1 = time.perf_counter()
+    train_time_seconds = float(t1 - t0)
+
+    # predict on 2024 
+    X_test = df_test_tr[feature_cols].copy()
+    for c in categorical_cols:
+        if c in X_test.columns:
+            X_test[c] = X_test[c].astype("category")
+
+    pred_col = f"pred_{variant_name}"
+    df_test_with_pred, pred_time_seconds, n_races, n_riders = time_prediction_xgb(
+        model, X_test, df_test_tr, pred_col=pred_col
+    )
+
+    # evaluate per race 
+    df_summary, metrics = evaluate_on_2024(df_test_with_pred, pred_col=pred_col, k_top=10)
+
+    # SHAP Values per race (top-10 AND all riders)
+    shap_time_seconds = np.nan
+    if run_shap_per_race:
+        df_shap, bias, shap_time_seconds, _ = compute_xgb_contribs(
+            booster=model,
+            X=X_test,
+            df_meta=df_test_with_pred,      # contains query_id + pred_col
+            feature_names=feature_cols,
+            query_col=query_col,
+            categorical_cols=categorical_cols,
+            pred_col=pred_col,
+        )
+
+        summ = summarize_shap_topk_and_all(
+            df_shap=df_shap,
+            feature_names=feature_cols,
+            query_col=query_col,
+            pred_col=pred_col,
+            k=10,
+            prefix_all="shap_all_",
+            prefix_top="shap_top10_",
+        )
+
+        df_summary = df_summary.merge(summ["race_all"], on=query_col, how="left")
+        df_summary = df_summary.merge(summ["race_topk"], on=query_col, how="left")
+
+        all_shap_global_all[variant_name] = summ["global_all"].assign(variant=variant_name)
+        all_shap_global_top10[variant_name] = summ["global_topk"].assign(variant=variant_name)
+
+    # add timing cols (optional, but convenient)
+    df_summary["train_time_seconds"] = train_time_seconds
+    df_summary["pred_time_seconds"] = pred_time_seconds
+    df_summary["pred_time_per_race"] = pred_time_seconds / max(1, n_races)
+    df_summary["pred_time_per_rider"] = pred_time_seconds / max(1, n_riders)
+
+    rows += [
+        {"type": "meta", "param": "num_trees", "value": num_trees_final},
+        {"type": "meta", "param": "cv_best_mean_ndcg@10", "value": cv_best},
+        {"type": "meta", "param": "train_time_seconds", "value": train_time_seconds},
+        {"type": "meta", "param": "pred_time_seconds", "value": pred_time_seconds},
+        {"type": "meta", "param": "pred_time_per_race", "value": pred_time_seconds / max(1, n_races)},
+        {"type": "meta", "param": "pred_time_per_rider", "value": pred_time_seconds / max(1, n_riders)},
+    ]
+
+    # add per-fold NDCG rows (only when Optuna ran)
+    for fold_name, fold_score in fold_ndcg_best.items():
+        rows.append({
+            "type": "cv_fold",
+            "param": f"{fold_name}_ndcg@{ndcg_at}",
+            "value": float(fold_score),
+        })
+
+    # add final evaluation metrics
+    for mk, mv in metrics.items():
+        rows.append({"type": "final_eval", "param": mk, "value": mv})
+
+    print("Final (2024) metrics:", metrics)
