@@ -1,0 +1,1704 @@
+# -*- coding: utf-8 -*-
+"""
+Predicting women's road cycling races with CatBoost 
+
+CatBoost ranker — 8 variants:
+(tuned/default tree) × (decay/no-decay) × (skew/no-skew)
+
+Outputs:
+- race_summaries_catboost_2024.xlsx
+- hyperparameters_catboost_2024.xlsx
+- appends/replaces sheets in:
+- race_summaries_all_models_2024.xlsx
+- hyperparameters_all_models_2024.xlsx
+"""
+
+
+# %% Import packages
+import os
+import time
+import numpy as np
+import pandas as pd
+
+from typing import Any, Dict, List, Tuple
+
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from scipy.stats import spearmanr
+from scipy.stats import skew as scipy_skew
+from sklearn.preprocessing import PowerTransformer
+
+import optuna
+from optuna.samplers import TPESampler
+
+from catboost import CatBoostRanker, Pool
+
+from pathlib import Path
+from datetime import datetime
+import json
+import pickle
+
+# %% Configuration
+
+# Read data
+dataset = pd.read_excel("dataset_women_prediction.xlsx")  # <-- fill in your Excel path
+
+# Prepare dataset for modelling
+df = dataset.copy()
+
+# Keep numeric results only
+if "result" not in df.columns:
+    raise KeyError("Expected a 'result' column.")
+df = df[pd.to_numeric(df["result"], errors="coerce").notna()].copy()
+df["result"] = df["result"].astype(int)
+
+# Check required columns
+for col in ["query_id", "year"]:
+    if col not in df.columns:
+        raise KeyError(f"Expected '{col}' column.")
+
+# If name is missing, create a placeholder (so evaluate_on_2024 does not crash)
+if "name" not in df.columns:
+    df["name"] = df.index.astype(str)
+
+# Sort within each query using time order (if 'date' exists)
+if "date" in df.columns:
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.sort_values(["query_id", "date"]).reset_index(drop=True)
+else:
+    df = df.sort_values(["query_id"]).reset_index(drop=True)
+
+# Feature list
+features = [
+    "age_at_race", "continent", "birth_month", "season_number",
+    "races_last_12_months", "num_races_last_12_months_same_profile",
+    "pcs_points_last_12_months", "avg_pcs_points_last_12_months", "std_pcs_points_last_12_months",
+    "pcs_points_last_12_months_same_profile", "avg_pcs_points_last_12_months_same_profile", "std_pcs_points_last_12_months_same_profile",
+    "team_strength_12m", "team_strength_12m_same_profile",
+    "relative_team_rank", "relative_team_rank_same_profile",
+    "pcs_points_change_vs_prev_year", "pcs_points_pct_change_same_profile",
+    "pcs_points_last_6_weeks", "avg_pcs_points_last_6_weeks", "std_pcs_points_last_6_weeks",
+    "pcs_points_last_6_weeks_same_profile", "avg_pcs_points_last_6_weeks_same_profile", "std_pcs_points_last_6_weeks_same_profile",
+]
+
+features_base = [c for c in features if c in df.columns]
+
+# Categorical features
+categorical = [c for c in ["continent", "birth_month"] if c in features_base]
+
+# Catboost can't deal with missing values 'nan' in categorical, so replace them with missing
+missing_cat = "missing"
+for c in categorical:
+    df[c] = df[c].astype("object").fillna(missing_cat).astype(str)
+
+# Numeric features
+numeric_features = [c for c in features_base if c not in categorical]
+
+# Reproducibility settings
+seed = 42
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+thread_count = 1
+
+# Time-series folds
+folds = [
+    {"name": "fold1", "train_years": [2019, 2020],             "val_year": 2021},
+    {"name": "fold2", "train_years": [2019, 2020, 2021],       "val_year": 2022},
+    {"name": "fold3", "train_years": [2019, 2020, 2021, 2022], "val_year": 2023},
+]
+final_test_year = 2024
+
+# 8 CatBoost variants: set True/False
+RUN_CAT_TUNED_DECAY_SKEW         = False
+RUN_CAT_DEFAULT_DECAY_SKEW       = False
+RUN_CAT_TUNED_NODECAY_SKEW       = False
+RUN_CAT_DEFAULT_NODECAY_SKEW     = False
+
+RUN_CAT_TUNED_DECAY_NOSKEW       = False
+RUN_CAT_DEFAULT_DECAY_NOSKEW     = True
+RUN_CAT_TUNED_NODECAY_NOSKEW     = False 
+RUN_CAT_DEFAULT_NODECAY_NOSKEW   = False
+
+# Set Optuna / training settings 
+ndcg_at = 10
+n_trials = 200
+num_boost_round = 2000
+early_stopping_rounds = 150
+cat_eval_metric = f"NDCG:top={ndcg_at};type=Exp"
+
+# Optional SHAP-per-race (OFF by default)
+run_shap_per_race = False
+
+
+# %% Label + label_gain 
+
+if "rel_grade_0_31" not in df.columns:
+    # If you already built this in LightGBM, it should exist. Otherwise create it.
+    # Map result -> relevance grade 0..31 within each query (1=best -> 31).
+    gsize = df.groupby("query_id", sort=False)["result"].transform("count").astype(int)
+    den = (gsize - 1).replace(0, 1)
+    rel = (gsize + 1 - df["result"]).clip(lower=1).astype(float)
+    df["rel_grade_0_31"] = np.floor((rel - 1) * 31 / den).astype(int)
+
+df["rel_grade_0_31"] = df["rel_grade_0_31"].astype(int)
+max_label = int(df["rel_grade_0_31"].max())
+label_gain = np.array([2**i - 1 for i in range(max_label + 1)], dtype=float)
+print("label_gain length:", len(label_gain))
+print("max_label:", max_label)
+
+
+# %% CatBoost hyperparameter key lists (for reporting)
+
+cat_tree_param_keys = [
+    "learning_rate",
+    "depth",
+    "l2_leaf_reg",
+    "subsample",
+]
+
+decay_param_keys = [
+    "floor_f",
+    "gamma_strength",
+    "tau_u",
+    "knee_rel_u",
+    "a_dlog",
+]
+
+# %% NDCG helper
+
+def _dcg_at_k(gains: np.ndarray, k: int) -> float:
+    k = min(k, len(gains))
+    if k == 0:
+        return 0.0
+    discounts = 1.0 / np.log2(np.arange(2, k + 2))
+    return float(np.sum(gains[:k] * discounts))
+
+def ndcg_at_k_labels_scores(
+    labels: np.ndarray,
+    scores: np.ndarray,
+    k: int,
+    label_gain: np.ndarray,
+) -> float:
+    if len(labels) == 0:
+        return 0.0
+    labels = labels.astype(int)
+    gains = label_gain[labels]
+
+    order_ideal = np.argsort(gains)[::-1]
+    ideal_gains = gains[order_ideal]
+    idcg = _dcg_at_k(ideal_gains, k)
+    if idcg == 0:
+        return 0.0
+
+    order_pred = np.argsort(scores)[::-1]
+    pred_gains = gains[order_pred]
+    dcg = _dcg_at_k(pred_gains, k)
+
+    return float(dcg / idcg)
+
+
+# %% Skew-based transforms (fit on train only, apply anywhere)
+"""
+Auto skew transforms:
+- identity
+- log1p (only if nonnegative in TRAIN and not blacklisted)
+- yeo-johnson fallback
+Skewness assessment done on training set only, to prevent data leakage
+"""
+ 
+def fit_auto_skew_transforms(
+    df_train: pd.DataFrame,
+    numeric_features: List[str],
+    categorical_features: List[str],
+    skew_threshold: float = 1.0,
+    min_rel_improve: float = 0.20,
+    min_n: int = 10,
+) -> Tuple[Dict[str, Dict[str, Any]], pd.DataFrame]:
+   
+    NO_LOG_FEATURES = {
+        "pcs_points_change_vs_prev_year",
+        "pcs_points_pct_change_same_profile",
+        "relative_team_rank",
+        "relative_team_rank_same_profile",
+    }
+
+    cat = set(categorical_features)
+    transform_specs: Dict[str, Dict[str, Any]] = {}
+    report_rows: List[Dict[str, Any]] = []
+
+    def _to_float_arr(s: pd.Series) -> np.ndarray:
+        return pd.to_numeric(s, errors="coerce").astype(float).to_numpy()
+
+    def _sk(arr: np.ndarray) -> float:
+        x = arr[np.isfinite(arr)]
+        if x.size < min_n:
+            return np.nan
+        if np.nanstd(x) < 1e-12:
+            return 0.0
+        return float(scipy_skew(x, bias=False))
+
+    def _accept(orig_sk: float, new_sk: float) -> bool:
+        if not np.isfinite(new_sk):
+            return False
+        if abs(new_sk) <= skew_threshold:
+            return True
+        return abs(new_sk) <= (1.0 - min_rel_improve) * abs(orig_sk)
+
+    for feat in numeric_features:
+        if feat not in df_train.columns or feat in cat:
+            continue
+
+        xv = _to_float_arr(df_train[feat])
+        orig_sk = _sk(xv)
+
+        if not np.isfinite(orig_sk) or abs(orig_sk) <= skew_threshold:
+            transform_specs[feat] = {"method": "identity"}
+            report_rows.append({
+                "feature": feat, "status": "kept",
+                "orig_skew": float(orig_sk) if np.isfinite(orig_sk) else np.nan,
+                "method": "identity",
+                "new_skew": float(orig_sk) if np.isfinite(orig_sk) else np.nan,
+            })
+            continue
+
+        finite_mask = np.isfinite(xv)
+        if not finite_mask.any():
+            transform_specs[feat] = {"method": "identity"}
+            report_rows.append({
+                "feature": feat, "status": "skipped",
+                "orig_skew": float(orig_sk), "method": "identity", "new_skew": np.nan,
+            })
+            continue
+
+        min_val = float(np.nanmin(xv[finite_mask]))
+
+        # Stage 1: log1p ONLY (no shift)
+        log_evals: List[Tuple[str, Dict[str, Any], float]] = []
+        can_try_log = (min_val >= 0.0) and (feat not in NO_LOG_FEATURES)
+        if can_try_log:
+            x_log = np.full_like(xv, np.nan, dtype=float)
+            x_log[finite_mask] = np.log1p(xv[finite_mask])
+            sk_log = _sk(x_log)
+            if np.isfinite(sk_log):
+                log_evals.append(("log1p", {}, float(sk_log)))
+
+        best_log = min(log_evals, key=lambda t: abs(t[2])) if log_evals else None
+        log_good = [t for t in log_evals if abs(t[2]) <= skew_threshold]
+
+        if log_good:
+            method, params, new_sk = min(log_good, key=lambda t: abs(t[2]))
+            best = {"method": method, "params": params, "new_skew": float(new_sk)}
+        else:
+            # Stage 2: Yeo–Johnson
+            best = None
+            yj_eval = None
+            try:
+                pt = PowerTransformer(method="yeo-johnson", standardize=False)
+                z = pt.fit_transform(xv[finite_mask].reshape(-1, 1)).ravel()
+                z_full = np.full_like(xv, np.nan, dtype=float)
+                z_full[finite_mask] = z
+                yj_sk = _sk(z_full)
+                if np.isfinite(yj_sk):
+                    yj_eval = ("yeojohnson", {"pt": pt}, float(yj_sk))
+            except Exception:
+                yj_eval = None
+
+            candidates = []
+            if best_log is not None:
+                candidates.append(best_log)
+            if yj_eval is not None:
+                candidates.append(yj_eval)
+
+            if candidates:
+                method, params, new_sk = min(candidates, key=lambda t: abs(t[2]))
+                best = {"method": method, "params": params, "new_skew": float(new_sk)}
+
+        if best is None or (not _accept(orig_sk, best["new_skew"])):
+            transform_specs[feat] = {"method": "identity"}
+            report_rows.append({
+                "feature": feat, "status": "kept",
+                "orig_skew": float(orig_sk), "method": "identity", "new_skew": float(orig_sk),
+            })
+        else:
+            transform_specs[feat] = {"method": best["method"], **best["params"]}
+            report_rows.append({
+                "feature": feat, "status": "transformed",
+                "orig_skew": float(orig_sk),
+                "method": best["method"],
+                "new_skew": float(best["new_skew"]),
+            })
+
+    report = (
+        pd.DataFrame(report_rows)
+        .sort_values(["status", "feature"])
+        .reset_index(drop=True)
+    )
+    return transform_specs, report
+
+def apply_auto_skew_transforms(
+    df_in: pd.DataFrame,
+    features_base: List[str],
+    categorical_features: List[str],
+    transform_specs: Dict[str, Dict[str, Any]],
+) -> Tuple[pd.DataFrame, List[str]]:
+
+    cat = set(categorical_features)
+    df_out = df_in.copy()
+    used_features: List[str] = []
+
+    for feat in features_base:
+        if feat not in df_out.columns:
+            continue
+
+        if feat in cat:
+            used_features.append(feat)
+            continue
+
+        spec = transform_specs.get(feat, {"method": "identity"})
+        method = spec.get("method", "identity")
+
+        x = pd.to_numeric(df_out[feat], errors="coerce").astype(float)
+        arr = x.to_numpy()
+        m = np.isfinite(arr)
+        arr_new = arr.copy()
+
+        if method == "log1p":
+            z = arr[m].copy()
+            z[z <= -1.0] = np.nan
+            arr_new[m] = np.log1p(z)
+        elif method == "yeojohnson":
+            pt = spec.get("pt", None)
+            if pt is not None and m.any():
+                arr_new[m] = pt.transform(arr[m].reshape(-1, 1)).ravel()
+
+        df_out[feat] = pd.Series(arr_new, index=df_out.index)
+        used_features.append(feat)
+
+    return df_out, used_features
+
+
+# %% Delayed logistic decay weight function + query-age helpers
+
+def w_delayed_logistic_continuous(t, tau, T_knee, a, f):
+    t = np.asarray(t, dtype=float)
+    s = lambda x: 1.0 / (1.0 + np.exp((x - T_knee) / max(a, 1e-12)))
+    w = np.ones_like(t, dtype=float)
+    mask = t >= tau
+    if np.any(mask):
+        s_tau = max(s(tau), 1e-12)
+        w[mask] = f + (1.0 - f) * (s(t[mask]) / s_tau)
+    return np.clip(w, f, 1.0)
+
+def add_query_age_days(df_sub: pd.DataFrame, ref_date: pd.Timestamp) -> pd.DataFrame:
+    if "date" not in df_sub.columns:
+        raise KeyError("Need 'date' column for decay weights (query_age_days).")
+    q_date = df_sub.groupby("query_id", sort=False)["date"].max()
+    q_age = (ref_date - q_date).dt.days.clip(lower=0)
+    out = df_sub.copy()
+    out["query_age_days"] = out["query_id"].map(q_age).astype(int)
+    return out
+
+def build_query_weights_for_trial(df_sub: pd.DataFrame, trial, max_age_cap: int) -> np.ndarray:
+    if "query_age_days" not in df_sub.columns:
+        raise KeyError("Expected 'query_age_days' in df_sub. Call add_query_age_days first.")
+
+    MAX_AGE_LOCAL = int(max(1, df_sub["query_age_days"].max()))
+    MAX_AGE_CAP   = int(max(1, max_age_cap))
+
+    f = trial.suggest_float("floor_f", 0.01, 1.0)
+    gamma = trial.suggest_float("gamma_strength", 0.0, 1.0)
+
+    tau_u = trial.suggest_float("tau_u", 0.0, 1.0)
+    tau = int(np.floor(tau_u * MAX_AGE_LOCAL))
+
+    knee_rel_u = trial.suggest_float("knee_rel_u", 0.0, 1.0)
+    T_knee = tau + int(np.floor(knee_rel_u * (MAX_AGE_LOCAL - tau)))
+
+    a_low = 1.0
+    a_high = max(a_low, MAX_AGE_CAP / 4.394)
+    a = trial.suggest_float("a_dlog", a_low, a_high, log=True)
+
+    t_days = df_sub["query_age_days"].values.astype(float)
+    w_decay = w_delayed_logistic_continuous(t_days, tau, T_knee, a, f)
+    w_final = (1.0 - gamma) + gamma * w_decay
+
+    return np.clip(w_final, 1e-12, 1.0).astype(float)
+
+def row_weights_from_query_weights(df_sub: pd.DataFrame, w_row_like: np.ndarray, query_col="query_id") -> np.ndarray:
+    """
+    Convert per-row weights (constant within query) into per-row weights
+    that do NOT scale with field size: each query sums to ~w_query.
+    """
+    s = pd.Series(np.asarray(w_row_like, dtype=float), index=df_sub.index)
+
+    w_q = s.groupby(df_sub[query_col], sort=False).mean()
+    gsz = df_sub.groupby(query_col, sort=False).size()
+
+    w_row_out = df_sub[query_col].map(w_q / gsz).astype(float).to_numpy()
+    w_row_out = w_row_out / max(1e-12, float(np.mean(w_row_out)))
+    return w_row_out
+
+
+# %% Prediction timer helper
+
+def time_prediction_cat(model: CatBoostRanker,
+                        X_test: pd.DataFrame,
+                        df_test_template: pd.DataFrame,
+                        pred_col: str,
+                        model_name: str):
+    t_pred_start = time.perf_counter()
+    df_out = df_test_template.copy()
+    df_out[pred_col] = model.predict(X_test)
+    t_pred_end = time.perf_counter()
+
+    pred_time_seconds = t_pred_end - t_pred_start
+    n_races_2024 = df_out["query_id"].nunique()
+    n_riders_2024 = len(df_out)
+
+    print(f"\nPrediction time on 2024 for {model_name}: {pred_time_seconds:.3f} seconds")
+    print(f"  ≈ {pred_time_seconds / n_races_2024:.6f} seconds per race")
+    print(f"  ≈ {pred_time_seconds / n_riders_2024:.6f} seconds per rider")
+
+    return df_out, pred_time_seconds, n_races_2024, n_riders_2024
+
+# %% Makes NumPy/Pandas/Path objects JSON-serializable.
+
+def json_default(o):
+    # numpy scalars
+    if isinstance(o, (np.integer,)):
+        return int(o)
+    if isinstance(o, (np.floating,)):
+        return float(o)
+    # numpy arrays
+    if isinstance(o, (np.ndarray,)):
+        return o.tolist()
+    # pandas timestamp / datetime
+    if isinstance(o, (pd.Timestamp, datetime)):
+        return o.isoformat()
+    # paths
+    if isinstance(o, Path):
+        return str(o)
+    raise TypeError(f"Object of type {type(o).__name__} is not JSON serializable")
+
+
+# %% Per-race evaluation helper (same output style as your LightGBM)
+
+def evaluate_on_2024(df_test_with_pred: pd.DataFrame, pred_col: str, final_test_year: int, k_top: int = 10):
+    df_eval = df_test_with_pred.copy()
+
+    df_eval["actual_rank"] = df_eval.groupby("query_id")["result"].rank(method="min", ascending=True)
+    df_eval["predicted_rank"] = df_eval.groupby("query_id")[pred_col].rank(method="first", ascending=False)
+
+    summary_rows = []
+    for qid, g in df_eval.groupby("query_id", sort=False):
+        g = g.copy()
+        n_riders = len(g)
+
+        g_actual = g.sort_values("result", ascending=True)
+        g_pred   = g.sort_values(pred_col, ascending=False)
+
+        k_eff = min(k_top, n_riders)
+
+        actual_names = g_actual["name"].tolist()[:k_eff]
+        pred_names   = g_pred["name"].tolist()[:k_eff]
+
+        row = {"query_id": qid, "n_riders": n_riders}
+        if "race_profile" in g.columns:
+            row["race_profile"] = g["race_profile"].iloc[0]
+
+        for i in range(k_top):
+            row[f"actual_rank_{i+1}"] = actual_names[i] if i < len(actual_names) else np.nan
+            row[f"pred_rank_{i+1}"]   = pred_names[i]   if i < len(pred_names)   else np.nan
+
+        if n_riders > 1:
+            # NDCG on full field (matches your XGB evaluation)
+            labels_q = g["rel_grade_0_31"].astype(int).values
+            scores_q = g[pred_col].astype(float).values
+            row["ndcg@10"] = ndcg_at_k_labels_scores(labels_q, scores_q, k=k_eff, label_gain=label_gain)
+
+            # Focus set = predicted top-k only (matches your XGB evaluation)
+            focus_idx = g_pred.index[:k_eff]
+            g_focus = g.loc[focus_idx]
+
+            if g_focus["predicted_rank"].nunique() > 1 and g_focus["actual_rank"].nunique() > 1:
+                rho = spearmanr(g_focus["predicted_rank"], g_focus["actual_rank"]).correlation
+                row["spearman_rho"] = float(rho) if np.isfinite(rho) else np.nan
+            else:
+                row["spearman_rho"] = np.nan
+
+            row["mae_rank"] = float(mean_absolute_error(g_focus["actual_rank"], g_focus["predicted_rank"]))
+            row["rmse_rank"] = float(np.sqrt(mean_squared_error(g_focus["actual_rank"], g_focus["predicted_rank"])))
+
+
+            # Top-3 overlap proportion (matches your XGB evaluation)
+            k3 = 3
+            if n_riders >= k3:
+                true_top3_idx = set(g_actual.index[:k3])
+                pred_top3_idx = set(g_pred.index[:k3])
+                row["top3_accuracy"] = len(true_top3_idx & pred_top3_idx) / k3
+            else:
+                row["top3_accuracy"] = np.nan
+
+            # Precision@10 overlap (same as XGB)
+            true_top_idx = set(g_actual.index[:k_eff])
+            pred_top_idx = set(g_pred.index[:k_eff])
+            row["precision@10"] = len(true_top_idx & pred_top_idx) / k_eff
+        else:
+            row["ndcg@10"] = np.nan
+            row["spearman_rho"] = np.nan
+            row["mae_rank"] = np.nan
+            row["rmse_rank"] = np.nan
+            row["top3_accuracy"] = np.nan
+            row["precision@10"] = np.nan
+
+        summary_rows.append(row)
+
+    df_summary = pd.DataFrame(summary_rows)
+
+    metrics = {
+        "mean_ndcg@10": float(df_summary["ndcg@10"].mean(skipna=True)),
+        "mean_spearman_rho": float(df_summary["spearman_rho"].mean(skipna=True)),
+        "mean_mae_rank": float(df_summary["mae_rank"].mean(skipna=True)),
+        "mean_rmse_rank": float(df_summary["rmse_rank"].mean(skipna=True)),
+        "mean_top3_accuracy": float(df_summary["top3_accuracy"].mean(skipna=True)),
+        "mean_precision@10": float(df_summary["precision@10"].mean(skipna=True)),
+    }
+
+    print(f"\nFinal hold-out year {final_test_year} (per-race averages) — model: {pred_col}")
+    for k, v in metrics.items():
+        print(f"  {k:22s} = {v:.4f}" if np.isfinite(v) else f"  {k:22s} = NaN")
+
+    return df_summary, metrics
+
+# %% Optional SHAP-per-race (NO-OP unless run_shap_per_race=True)
+
+def add_shap_per_race_catboost(
+    model: CatBoostRanker,
+    X_test: pd.DataFrame,
+    df_test_with_pred: pd.DataFrame,
+    df_race_summary: pd.DataFrame,
+    feature_names: List[str],
+    cat_feature_indices: List[int],
+    shap_prefix_all: str = "shap_all_",
+    shap_prefix_top: str = "shap_top10_",
+    k_top: int = 10,
+):
+    if not run_shap_per_race:
+        return df_race_summary
+
+    pool = Pool(X_test[feature_names], cat_features=cat_feature_indices)
+    shap_vals = np.asarray(model.get_feature_importance(pool, type="ShapValues"))
+    if shap_vals.ndim != 2 or shap_vals.shape[1] != len(feature_names) + 1:
+        raise ValueError("Unexpected SHAP output shape from CatBoost.")
+
+    shap_only = shap_vals[:, :-1]
+    df_shap = pd.DataFrame(shap_only, columns=feature_names, index=X_test.index)
+
+    # attach meta
+    df_shap["query_id"] = df_test_with_pred.loc[X_test.index, "query_id"].values
+    df_shap["pred"]     = df_test_with_pred.loc[X_test.index, "pred"].values
+
+    # ---- ALL riders per race: mean |SHAP|
+    race_all = (
+        df_shap.set_index("query_id")[feature_names]
+        .abs().groupby(level=0).mean()
+        .rename(columns={f: f"{shap_prefix_all}{f}" for f in feature_names})
+        .reset_index()
+    )
+
+    # ---- TOP-k by prediction per race: mean |SHAP|
+    top_idx = (
+        df_shap[["query_id", "pred"]]
+        .groupby("query_id", sort=False)["pred"]
+        .nlargest(k_top)
+        .index.get_level_values(1)
+    )
+    df_top = df_shap.loc[top_idx]
+
+    race_top = (
+        df_top.set_index("query_id")[feature_names]
+        .abs().groupby(level=0).mean()
+        .rename(columns={f: f"{shap_prefix_top}{f}" for f in feature_names})
+        .reset_index()
+    )
+
+    out = df_race_summary.merge(race_all, on="query_id", how="left")
+    out = out.merge(race_top, on="query_id", how="left")
+    return out
+
+# %% Save model
+
+def save_catboost_variant(
+    *,
+    variant_name: str,
+    model: CatBoostRanker,
+    out_root: Path,
+    final_test_year: int,
+    train_years_final: list[int],
+    feature_cols: list[str],
+    cat_feature_indices: list[int],
+    transform_specs: object | None = None,   # pickle if you want
+    extra_meta: dict | None = None,
+):
+    out_root.mkdir(parents=True, exist_ok=True)
+    (out_root / "models").mkdir(parents=True, exist_ok=True)
+    (out_root / "meta").mkdir(parents=True, exist_ok=True)
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    train_tag = f"train{min(train_years_final)}-{max(train_years_final)}"
+
+    model_path = out_root / "models" / f"cat_{variant_name}_{train_tag}_predict{final_test_year}_{ts}.cbm"
+    model.save_model(str(model_path))
+
+    feat_path = out_root / "meta" / f"features_{variant_name}_{ts}.json"
+    with open(feat_path, "w", encoding="utf-8") as f:
+        json.dump(feature_cols, f, indent=2, default=json_default)
+
+    cat_idx_path = out_root / "meta" / f"cat_feature_indices_{variant_name}_{ts}.json"
+    with open(cat_idx_path, "w", encoding="utf-8") as f:
+        json.dump(cat_feature_indices, f, indent=2, default=json_default)
+
+    tx_path = None
+    if transform_specs is not None:
+        tx_path = out_root / "meta" / f"transform_specs_{variant_name}_{ts}.pkl"
+        with open(tx_path, "wb") as f:
+            pickle.dump(transform_specs, f)
+
+    meta = {
+        "variant": variant_name,
+        "saved_at": ts,
+        "final_test_year": final_test_year,
+        "train_years_final": train_years_final,
+        "model_file": str(model_path),
+        "features_file": str(feat_path),
+        "cat_feature_indices_file": str(cat_idx_path),
+        "transform_specs_file": (str(tx_path) if tx_path else None),
+    }
+    if extra_meta:
+        meta.update(extra_meta)
+
+    meta_path = out_root / "meta" / f"meta_{variant_name}_{ts}.json"
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2, default=json_default)
+
+    print(f"[saved] {variant_name}")
+    print("  model:", model_path)
+    print("  feats:", feat_path)
+    print("  cat  :", cat_idx_path)
+    if tx_path: print("  tx   :", tx_path)
+    print("  meta :", meta_path)
+
+
+# %% Data prep helpers (final split + fold split)
+
+def prepare_train_val_split(df_all: pd.DataFrame, train_years: List[int], val_year: int):
+    df_train = df_all[df_all["year"].isin(train_years)].copy()
+    df_val   = df_all[df_all["year"] == val_year].copy()
+
+    if "date" in df_train.columns:
+        df_train = df_train.sort_values(["query_id", "date"]).reset_index(drop=True)
+    else:
+        df_train = df_train.sort_values(["query_id"]).reset_index(drop=True)
+
+    if "date" in df_val.columns:
+        df_val = df_val.sort_values(["query_id", "date"]).reset_index(drop=True)
+    else:
+        df_val = df_val.sort_values(["query_id"]).reset_index(drop=True)
+
+    return df_train, df_val
+
+def apply_skew_if_needed(df_train: pd.DataFrame, df_val: pd.DataFrame, use_skew: bool):
+    if not use_skew:
+        return df_train, df_val, features_base, None
+
+    transform_specs, _ = fit_auto_skew_transforms(
+        df_train=df_train,
+        numeric_features=numeric_features,
+        categorical_features=categorical,
+        skew_threshold=1.0,
+        min_rel_improve=0.20,
+    )
+
+    df_train_tr, FEATURES_TRAIN = apply_auto_skew_transforms(df_train, features_base, categorical, transform_specs)
+    df_val_tr, _ = apply_auto_skew_transforms(df_val, features_base, categorical, transform_specs)
+
+    present_features = [c for c in FEATURES_TRAIN if c in df_train_tr.columns]
+    return df_train_tr, df_val_tr, present_features, transform_specs
+
+def final_train_test_split(df_all: pd.DataFrame, final_test_year: int):
+    train_years_final = sorted(y for y in df_all["year"].unique() if y < final_test_year)
+    df_train_final = df_all[df_all["year"].isin(train_years_final)].copy()
+    df_test_final  = df_all[df_all["year"] == final_test_year].copy()
+
+    if "date" in df_train_final.columns:
+        df_train_final = df_train_final.sort_values(["query_id", "date"]).reset_index(drop=True)
+    else:
+        df_train_final = df_train_final.sort_values(["query_id"]).reset_index(drop=True)
+
+    if "date" in df_test_final.columns:
+        df_test_final = df_test_final.sort_values(["query_id", "date"]).reset_index(drop=True)
+    else:
+        df_test_final = df_test_final.sort_values(["query_id"]).reset_index(drop=True)
+
+    return train_years_final, df_train_final, df_test_final
+
+
+# %% Optuna tuners (with skew/no-skew switch)
+
+def tune_catboost_ranker_cv_with_decay(df_all, folds, use_skew: bool, ndcg_at=ndcg_at, n_trials=n_trials, seed=seed):
+    # ---- PREPARE folds ONCE (no trial dependence) ----
+    prepared_folds = []
+    max_age_cap_days_local = 1
+
+    for fold in folds:
+        df_train, df_val = prepare_train_val_split(df_all, fold["train_years"], fold["val_year"])
+
+        # query age relative to end of TRAIN (compute once)
+        ref_date = df_train["date"].max()
+        df_train = add_query_age_days(df_train, ref_date)
+        df_val   = add_query_age_days(df_val, ref_date)
+
+        # data-driven max age cap across folds (TRAIN only)
+        max_age_cap_days_local = max(max_age_cap_days_local, int(df_train["query_age_days"].max()))
+
+        # skew transforms fit/apply once (if enabled)
+        df_train_tr, df_val_tr, present_features, _ = apply_skew_if_needed(df_train, df_val, use_skew)
+
+        X_train = df_train_tr[present_features].copy()
+        X_val   = df_val_tr[present_features].copy()
+
+        for c in categorical:
+            if c in X_train.columns:
+                X_train[c] = X_train[c].astype("category")
+            if c in X_val.columns:
+                X_val[c] = X_val[c].astype("category")
+
+        y_train = df_train_tr["rel_grade_0_31"].astype(int).values
+        y_val   = df_val_tr["rel_grade_0_31"].astype(int).values
+
+        group_train = df_train_tr["query_id"].values
+        group_val   = df_val_tr["query_id"].values
+
+        cat_idx_fold = [present_features.index(c) for c in categorical if c in present_features]
+
+        # lightweight meta for fast weight computation (aligned to X_train rows)
+        train_meta = df_train_tr[["query_id", "query_age_days"]].copy()
+
+        # precompute per-query indices for fast NDCG evaluation
+        val_idx_by_query = []
+        qid_vals = group_val
+        # preserve query order as encountered
+        seen = {}
+        for i, qid in enumerate(qid_vals):
+            if qid not in seen:
+                seen[qid] = []
+            seen[qid].append(i)
+        for qid in seen:
+            val_idx_by_query.append(np.asarray(seen[qid], dtype=int))
+
+        prepared_folds.append({
+            "fold_name": fold["name"],
+            "X_train": X_train, "y_train": y_train, "group_train": group_train,
+            "X_val": X_val,     "y_val": y_val,     "group_val": group_val,
+            "cat_idx": cat_idx_fold,
+            "train_meta": train_meta,
+            "val_idx_by_query": val_idx_by_query,
+        })
+
+    fold_year_map = {f["name"]: int(f["val_year"]) for f in folds}
+
+    def objective(trial):
+        # tree params
+        learning_rate = trial.suggest_float("learning_rate", 0.01, 0.30, log=True)
+        depth         = trial.suggest_int("depth", 4, 10)
+        l2_leaf_reg   = trial.suggest_float("l2_leaf_reg", 1.0, 100.0, log=True)
+        subsample     = trial.suggest_float("subsample", 0.5, 1.0)
+
+        fold_ndcgs = []
+        fold_best_iters = []
+
+        fold_ndcg_by_name = {}
+        fold_trees_by_name = {}
+
+        for fold_pack in prepared_folds:
+            # ---- compute weights quickly from cached train_meta ----
+            w_q_like = build_query_weights_for_trial(fold_pack["train_meta"], trial, max_age_cap_days_local)
+
+            # Make total weight per query independent of group size:
+            w_row = row_weights_from_query_weights(fold_pack["train_meta"], w_q_like, query_col="query_id")
+
+            train_pool = Pool(
+                data=fold_pack["X_train"],
+                label=fold_pack["y_train"],
+                group_id=fold_pack["group_train"],
+                group_weight=w_row,
+                cat_features=fold_pack["cat_idx"],
+            )
+
+            val_pool = Pool(
+                data=fold_pack["X_val"],
+                label=fold_pack["y_val"],
+                group_id=fold_pack["group_val"],
+                cat_features=fold_pack["cat_idx"],
+            )
+
+            model = CatBoostRanker(
+                thread_count=thread_count,
+                loss_function="YetiRank",
+                eval_metric=cat_eval_metric,
+                boosting_type="Ordered",
+                sampling_unit="Group",
+                depth=depth,
+                learning_rate=learning_rate,
+                l2_leaf_reg=l2_leaf_reg,
+                bootstrap_type="Bernoulli",
+                subsample=subsample,
+                random_seed=seed,
+                task_type="CPU",
+                iterations=num_boost_round,
+                od_type="Iter",
+                od_wait=early_stopping_rounds,
+                verbose=False,
+            )
+
+            model.fit(train_pool, eval_set=val_pool, use_best_model=True, verbose=False)
+            fold_best_iters.append(int(model.tree_count_))
+
+            val_pred = model.predict(val_pool)
+
+            # ---- per-query NDCG (fast, using cached indices) ----
+            ndcgs_this_fold = []
+            y_val = fold_pack["y_val"]
+            for idx in fold_pack["val_idx_by_query"]:
+                labels_q = y_val[idx].astype(int)
+                scores_q = val_pred[idx].astype(float)
+                k_eff = min(ndcg_at, len(labels_q))
+                ndcgs_this_fold.append(
+                    ndcg_at_k_labels_scores(labels_q, scores_q, k=k_eff, label_gain=label_gain)
+                )
+
+            fold_mean_ndcg = float(np.mean(ndcgs_this_fold)) if ndcgs_this_fold else 0.0
+            fold_ndcgs.append(fold_mean_ndcg)
+
+            # store per-fold diagnostics
+            trial.set_user_attr(f"ndcg_{fold_pack['fold_name']}", fold_mean_ndcg)
+            trial.set_user_attr(f"trees_{fold_pack['fold_name']}", int(model.tree_count_))
+
+            fold_ndcg_by_name[fold_pack["fold_name"]] = float(fold_mean_ndcg)
+            fold_trees_by_name[fold_pack["fold_name"]] = int(model.tree_count_)
+
+        best_fold = max(
+            fold_ndcg_by_name.keys(),
+            key=lambda fn: (fold_ndcg_by_name[fn], fold_year_map.get(fn, -1)),
+        )
+        trial.set_user_attr("mean_best_iter", int(fold_trees_by_name[best_fold]))
+        return float(np.mean(fold_ndcgs))
+
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=TPESampler(seed=seed, multivariate=True),
+    )
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+
+    trees_last_fold = int(study.best_trial.user_attrs["mean_best_iter"])
+
+    best_tree_params  = {k: study.best_trial.params[k] for k in cat_tree_param_keys if k in study.best_trial.params}
+    best_decay_params = {k: study.best_trial.params[k] for k in decay_param_keys if k in study.best_trial.params}
+
+    return study, best_tree_params, best_decay_params, trees_last_fold
+
+
+def tune_catboost_ranker_cv_nodecay(df_all, folds, use_skew: bool, ndcg_at=ndcg_at, n_trials=n_trials, seed=seed):
+    # ---- PREPARE folds ONCE (no trial dependence) ----
+    prepared_folds = []
+    for fold in folds:
+        df_train, df_val = prepare_train_val_split(df_all, fold["train_years"], fold["val_year"])
+        df_train_tr, df_val_tr, present_features, _ = apply_skew_if_needed(df_train, df_val, use_skew)
+
+        X_train = df_train_tr[present_features].copy()
+        X_val   = df_val_tr[present_features].copy()
+
+        for c in categorical:
+            if c in X_train.columns:
+                X_train[c] = X_train[c].astype("category")
+            if c in X_val.columns:
+                X_val[c] = X_val[c].astype("category")
+
+        y_train = df_train_tr["rel_grade_0_31"].astype(int).values
+        y_val   = df_val_tr["rel_grade_0_31"].astype(int).values
+
+        group_train = df_train_tr["query_id"].values
+        group_val   = df_val_tr["query_id"].values
+
+        cat_idx_fold = [present_features.index(c) for c in categorical if c in present_features]
+
+        prepared_folds.append({
+            "fold_name": fold["name"],
+            "X_train": X_train, "y_train": y_train, "group_train": group_train,
+            "X_val": X_val,     "y_val": y_val,     "group_val": group_val,
+            "cat_idx": cat_idx_fold,
+        })
+
+    fold_year_map = {f["name"]: int(f["val_year"]) for f in folds}
+
+    def objective(trial):
+        learning_rate = trial.suggest_float("learning_rate", 0.01, 0.30, log=True)
+        depth         = trial.suggest_int("depth", 4, 10)
+        l2_leaf_reg   = trial.suggest_float("l2_leaf_reg", 1.0, 100.0, log=True)
+        subsample     = trial.suggest_float("subsample", 0.5, 1.0)
+
+        fold_ndcgs = []
+        fold_best_iters = []
+
+        fold_ndcg_by_name = {}
+        fold_trees_by_name = {}
+
+        for fold_pack in prepared_folds:
+            train_pool = Pool(
+                data=fold_pack["X_train"],
+                label=fold_pack["y_train"],
+                group_id=fold_pack["group_train"],
+                cat_features=fold_pack["cat_idx"],
+            )
+            val_pool = Pool(
+                data=fold_pack["X_val"],
+                label=fold_pack["y_val"],
+                group_id=fold_pack["group_val"],
+                cat_features=fold_pack["cat_idx"],
+            )
+
+            model = CatBoostRanker(
+                thread_count=thread_count,
+                loss_function="YetiRank",
+                eval_metric=cat_eval_metric,
+                boosting_type="Ordered",
+                sampling_unit="Group",
+                depth=depth,
+                learning_rate=learning_rate,
+                l2_leaf_reg=l2_leaf_reg,
+                bootstrap_type="Bernoulli",
+                subsample=subsample,
+                random_seed=seed,
+                task_type="CPU",
+                iterations=num_boost_round,
+                od_type="Iter",
+                od_wait=early_stopping_rounds,
+                verbose=False,
+            )
+
+            model.fit(train_pool, eval_set=val_pool, use_best_model=True, verbose=False)
+            fold_best_iters.append(model.tree_count_)
+
+            val_pred = model.predict(val_pool)
+
+            # compute per-query NDCG
+            df_val_metric = pd.DataFrame({
+                "query_id": fold_pack["group_val"],
+                "label": fold_pack["y_val"],
+                "pred":  val_pred,
+            })
+
+            ndcgs_this_fold = []
+            for _, g in df_val_metric.groupby("query_id"):
+                labels_q = g["label"].values.astype(int)
+                scores_q = g["pred"].values.astype(float)
+                k_eff = min(ndcg_at, len(labels_q))
+                ndcgs_this_fold.append(
+                    ndcg_at_k_labels_scores(labels_q, scores_q, k=k_eff, label_gain=label_gain)
+                )
+
+            fold_mean_ndcg = float(np.mean(ndcgs_this_fold)) if ndcgs_this_fold else 0.0
+            fold_ndcgs.append(fold_mean_ndcg)
+
+            # keep per-fold diagnostics
+            trial.set_user_attr(f"ndcg_{fold_pack['fold_name']}", fold_mean_ndcg)
+            trial.set_user_attr(f"trees_{fold_pack['fold_name']}", int(model.tree_count_))
+
+            fold_ndcg_by_name[fold_pack["fold_name"]] = float(fold_mean_ndcg)
+            fold_trees_by_name[fold_pack["fold_name"]] = int(model.tree_count_)
+
+        best_fold = max(
+            fold_ndcg_by_name.keys(),
+            key=lambda fn: (fold_ndcg_by_name[fn], fold_year_map.get(fn, -1)),
+        )
+        trial.set_user_attr("mean_best_iter", int(fold_trees_by_name[best_fold]))
+        return float(np.mean(fold_ndcgs))
+
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=TPESampler(seed=seed, multivariate=True),
+    )
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+
+    trees_last_fold = int(study.best_trial.user_attrs["mean_best_iter"])
+
+    best_tree_params = {k: study.best_trial.params[k] for k in cat_tree_param_keys if k in study.best_trial.params}
+    return study, best_tree_params, trees_last_fold
+
+
+def tune_catboost_decay_only_cv(df_all, folds, use_skew: bool, ndcg_at=ndcg_at, n_trials=n_trials, seed=seed):
+    depth_default       = 6
+    l2_leaf_reg_default = 3.0
+    subsample_default   = 0.5
+
+    # ---- PREPARE folds ONCE (no trial dependence) ----
+    prepared_folds = []
+    max_age_cap_days_local = 1
+
+    for fold in folds:
+        df_train, df_val = prepare_train_val_split(df_all, fold["train_years"], fold["val_year"])
+
+        # query age relative to end of TRAIN (compute once)
+        ref_date = df_train["date"].max()
+        df_train = add_query_age_days(df_train, ref_date)
+        df_val   = add_query_age_days(df_val, ref_date)
+
+        # data-driven max age cap across folds (TRAIN only)
+        max_age_cap_days_local = max(max_age_cap_days_local, int(df_train["query_age_days"].max()))
+
+        # skew transforms fit/apply once (if enabled)
+        df_train_tr, df_val_tr, present_features, _ = apply_skew_if_needed(df_train, df_val, use_skew)
+
+        X_train = df_train_tr[present_features].copy()
+        X_val   = df_val_tr[present_features].copy()
+
+        for c in categorical:
+            if c in X_train.columns:
+                X_train[c] = X_train[c].astype("category")
+            if c in X_val.columns:
+                X_val[c] = X_val[c].astype("category")
+
+        y_train = df_train_tr["rel_grade_0_31"].astype(int).values
+        y_val   = df_val_tr["rel_grade_0_31"].astype(int).values
+
+        group_train = df_train_tr["query_id"].values
+        group_val   = df_val_tr["query_id"].values
+
+        cat_idx_fold = [present_features.index(c) for c in categorical if c in present_features]
+
+        # lightweight meta for fast weight computation (aligned to X_train/X_val rows)
+        train_meta = df_train_tr[["query_id", "query_age_days"]].copy()
+        val_meta   = df_val_tr[["query_id", "query_age_days"]].copy()
+
+        # keep same "style" as before (df_val_tr.copy() used only for query grouping)
+        df_val_qid = df_val_tr[["query_id"]].copy()
+
+        prepared_folds.append({
+            "fold_name": fold["name"],
+            "X_train": X_train, "y_train": y_train, "group_train": group_train,
+            "X_val": X_val,     "y_val": y_val,     "group_val": group_val,
+            "cat_idx": cat_idx_fold,
+            "train_meta": train_meta,
+            "val_meta": val_meta,
+            "df_val_qid": df_val_qid,
+        })
+
+    fold_year_map = {f["name"]: int(f["val_year"]) for f in folds}
+
+    def objective(trial):
+        fold_ndcgs = []
+        fold_best_iters = []
+
+        fold_ndcg_by_name = {}
+        fold_trees_by_name = {}
+
+        for fold_pack in prepared_folds:
+            # weights from cached meta (no skew recompute)
+           w_q_like = build_query_weights_for_trial(fold_pack["train_meta"], trial, max_age_cap_days_local)
+
+           # Make total weight per query independent of group size:
+           w_row = row_weights_from_query_weights(fold_pack["train_meta"], w_q_like, query_col="query_id")
+
+           train_pool = Pool(
+                data=fold_pack["X_train"],
+                label=fold_pack["y_train"],
+                group_id=fold_pack["group_train"],
+                group_weight=w_row,
+                cat_features=fold_pack["cat_idx"],
+           )
+
+           val_pool = Pool(
+                data=fold_pack["X_val"],
+                label=fold_pack["y_val"],
+                group_id=fold_pack["group_val"],
+                cat_features=fold_pack["cat_idx"],
+            )
+
+           model = CatBoostRanker(
+                thread_count=thread_count,
+                loss_function="YetiRank",
+                eval_metric=cat_eval_metric,
+                boosting_type="Ordered",
+                sampling_unit="Group",
+                depth=depth_default,
+                l2_leaf_reg=l2_leaf_reg_default,
+                bootstrap_type="Bernoulli",
+                subsample=subsample_default,
+                random_seed=seed,
+                task_type="CPU",
+                iterations=num_boost_round,
+                od_type="Iter",
+                od_wait=early_stopping_rounds,
+                verbose=False,
+            )
+
+           model.fit(train_pool, eval_set=val_pool, use_best_model=True, verbose=False)
+           fold_best_iters.append(int(model.tree_count_))
+
+           val_pred = model.predict(val_pool)
+
+           df_val_metric = fold_pack["df_val_qid"].copy()
+           df_val_metric["pred"]  = val_pred
+           df_val_metric["label"] = fold_pack["y_val"]
+
+           ndcgs_this_fold = []
+           for _, g in df_val_metric.groupby("query_id"):
+                labels_q = g["label"].values.astype(int)
+                scores_q = g["pred"].values.astype(float)
+                k_eff = min(ndcg_at, len(labels_q))
+                ndcgs_this_fold.append(
+                    ndcg_at_k_labels_scores(labels_q, scores_q, k=k_eff, label_gain=label_gain)
+                )
+
+           fold_mean_ndcg = float(np.mean(ndcgs_this_fold)) if ndcgs_this_fold else 0.0
+           fold_ndcgs.append(fold_mean_ndcg)
+
+           trial.set_user_attr(f"ndcg_{fold_pack['fold_name']}", fold_mean_ndcg)
+           trial.set_user_attr(f"trees_{fold_pack['fold_name']}", int(model.tree_count_))
+
+           fold_ndcg_by_name[fold_pack["fold_name"]] = float(fold_mean_ndcg)
+           fold_trees_by_name[fold_pack["fold_name"]] = int(model.tree_count_)
+
+        best_fold = max(
+            fold_ndcg_by_name.keys(),
+            key=lambda fn: (fold_ndcg_by_name[fn], fold_year_map.get(fn, -1)),
+        )
+        trial.set_user_attr("mean_best_iter", int(fold_trees_by_name[best_fold]))
+        return float(np.mean(fold_ndcgs))
+
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=TPESampler(seed=seed, multivariate=True),
+    )
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+
+    mean_trees = int(study.best_trial.user_attrs["mean_best_iter"])
+
+    best_decay_params = dict(study.best_trial.params)
+    return study, best_decay_params, mean_trees
+
+
+
+# %% Default nodecay: quick CV to estimate trees (skew/no-skew)
+
+def estimate_trees_default_nodecay(df_all, folds, use_skew: bool):
+    depth_default       = 6
+    l2_leaf_reg_default = 3.0
+    subsample_default   = 0.5
+    iterations_default  = num_boost_round
+
+    fold_ndcgs = []
+    fold_trees = []
+
+    fold_ndcg_by_name = {}
+    fold_trees_by_name = {}
+    fold_year_map = {f["name"]: int(f["val_year"]) for f in folds}
+
+    for fold in folds:
+        df_train, df_val = prepare_train_val_split(df_all, fold["train_years"], fold["val_year"])
+
+        df_train_tr, df_val_tr, present_features, _ = apply_skew_if_needed(df_train, df_val, use_skew)
+
+        X_train = df_train_tr[present_features].copy()
+        X_val   = df_val_tr[present_features].copy()
+
+        for c in categorical:
+            if c in X_train.columns:
+                X_train[c] = X_train[c].astype("category")
+            if c in X_val.columns:
+                X_val[c] = X_val[c].astype("category")
+
+        y_train = df_train_tr["rel_grade_0_31"].astype(int).values
+        y_val   = df_val_tr["rel_grade_0_31"].astype(int).values
+
+        group_train = df_train_tr["query_id"].values
+        group_val   = df_val_tr["query_id"].values
+
+        cat_idx_fold = [present_features.index(c) for c in categorical if c in present_features]
+
+        train_pool = Pool(
+            data=X_train,
+            label=y_train,
+            group_id=group_train,
+            cat_features=cat_idx_fold,
+        )
+        val_pool = Pool(
+            data=X_val,
+            label=y_val,
+            group_id=group_val,
+            cat_features=cat_idx_fold,
+        )
+
+        model = CatBoostRanker(
+            thread_count=thread_count,
+            loss_function="YetiRank",
+            eval_metric=cat_eval_metric,
+            boosting_type="Ordered",
+            sampling_unit="Group",
+            bootstrap_type="Bernoulli",
+            depth=depth_default,
+            l2_leaf_reg=l2_leaf_reg_default,
+            subsample=subsample_default,
+            random_seed=seed,
+            task_type="CPU",
+            iterations=iterations_default,
+            od_type="Iter",
+            od_wait=early_stopping_rounds,
+            verbose=False,
+        )
+
+        model.fit(train_pool, eval_set=val_pool, use_best_model=True, verbose=False)
+
+        fold_trees.append(int(model.tree_count_))
+
+        val_pred = model.predict(val_pool)
+        df_val_metric = df_val_tr.copy()
+        df_val_metric["pred"] = val_pred
+        df_val_metric["label"] = y_val
+
+        ndcgs_this_fold = []
+        for _, g in df_val_metric.groupby("query_id"):
+            labels_q = g["label"].values.astype(int)
+            scores_q = g["pred"].values.astype(float)
+            k_eff = min(ndcg_at, len(labels_q))
+            ndcgs_this_fold.append(
+                ndcg_at_k_labels_scores(labels_q, scores_q, k=k_eff, label_gain=label_gain)
+            )
+
+        fold_mean_ndcg = float(np.mean(ndcgs_this_fold)) if ndcgs_this_fold else 0.0
+        fold_ndcgs.append(float(fold_mean_ndcg) if ndcgs_this_fold else 0.0)
+
+        fold_ndcg_by_name[fold["name"]] = float(fold_mean_ndcg)
+        fold_trees_by_name[fold["name"]] = int(model.tree_count_)
+
+    cv_mean_ndcg = float(np.mean(fold_ndcgs)) if fold_ndcgs else 0.0
+    if fold_ndcg_by_name:
+        best_fold = max(
+            fold_ndcg_by_name.keys(),
+            key=lambda fn: (fold_ndcg_by_name[fn], fold_year_map.get(fn, -1)),
+        )
+        mean_trees = int(fold_trees_by_name[best_fold])
+    else:
+        mean_trees   = int(fold_trees[-1]) if fold_trees else num_boost_round
+
+    return cv_mean_ndcg, mean_trees
+
+
+# %% Final train/test builders (skew/no-skew)
+
+def build_final_train_test(use_skew: bool):
+    train_years_final, df_train_final, df_test_final = final_train_test_split(df, final_test_year)
+
+    if use_skew:
+        transform_specs_final, _ = fit_auto_skew_transforms(
+            df_train=df_train_final,
+            numeric_features=numeric_features,
+            categorical_features=categorical,
+            skew_threshold=1.0,
+            min_rel_improve=0.20,
+        )
+        df_train_final_tr, FEATURES_FINAL = apply_auto_skew_transforms(
+            df_train_final, features_base, categorical, transform_specs_final
+        )
+        df_test_final_tr, _ = apply_auto_skew_transforms(
+            df_test_final, features_base, categorical, transform_specs_final
+        )
+    else:
+        transform_specs_final = None
+        df_train_final_tr = df_train_final.copy()
+        df_test_final_tr  = df_test_final.copy()
+        FEATURES_FINAL = list(features_base)
+
+    present_features_final = [c for c in FEATURES_FINAL if c in df_train_final_tr.columns]
+    X_train_final = df_train_final_tr[present_features_final].copy()
+    X_test_final  = df_test_final_tr[present_features_final].copy()
+
+    for c in categorical:
+        if c in X_train_final.columns:
+            X_train_final[c] = X_train_final[c].astype("category")
+        if c in X_test_final.columns:
+            X_test_final[c] = X_test_final[c].astype("category")
+
+    y_train_final = df_train_final_tr["rel_grade_0_31"].astype(int)
+    group_id_train_final = df_train_final_tr["query_id"].values
+    group_id_test_final  = df_test_final_tr["query_id"].values
+
+    cat_feature_indices = [present_features_final.index(c) for c in categorical if c in present_features_final]
+
+    return (
+        train_years_final,
+        df_train_final_tr,
+        df_test_final_tr,
+        X_train_final,
+        X_test_final,
+        y_train_final,
+        group_id_train_final,
+        group_id_test_final,
+        present_features_final,
+        cat_feature_indices,
+        transform_specs_final,
+    )
+
+
+
+# %% Variant runners (8 variants)
+
+def run_variant(
+    variant_sheet: str,
+    use_skew: bool,
+    tuned_tree: bool,
+    use_decay: bool,
+):
+    """
+    Returns (df_summary, df_hparams) for the variant.
+    """
+
+    # --- Build final split for this skew setting
+    (
+    train_years_final,
+    df_train_final_tr,
+    df_test_final_tr,
+    X_train_final,
+    X_test_final,
+    y_train_final,
+    group_id_train_final,
+    group_id_test_final,
+    present_features_final,
+    cat_feature_indices,
+    transform_specs_final,   # <-- add
+    ) = build_final_train_test(use_skew)
+
+    # --- Choose params
+    study = None
+    best_tree = None
+    best_decay = {}
+    num_trees = None
+    cv_best = None
+
+    # Tuned tree + decay
+    if tuned_tree and use_decay:
+        study, best_tree, best_decay, num_trees = tune_catboost_ranker_cv_with_decay(
+            df_all=df,
+            folds=folds,
+            use_skew=use_skew,
+            ndcg_at=ndcg_at,
+            n_trials=n_trials,
+            seed=seed,
+        )
+        cv_best = float(study.best_value)
+
+    # Default tree + tuned decay
+    elif (not tuned_tree) and use_decay:
+        study, best_decay, num_trees = tune_catboost_decay_only_cv(
+            df_all=df,
+            folds=folds,
+            use_skew=use_skew,
+            ndcg_at=ndcg_at,
+            n_trials=n_trials,
+            seed=seed,
+        )
+        cv_best = float(study.best_value)
+
+        # fixed defaults
+        best_tree = {
+            "depth": 6,
+            "l2_leaf_reg": 3.0,
+            "subsample": 0.5,
+            # NOTE: learning_rate not set (CatBoost chooses default)
+        }
+
+    # Tuned tree, no decay
+    elif tuned_tree and (not use_decay):
+        study, best_tree, num_trees = tune_catboost_ranker_cv_nodecay(
+            df_all=df,
+            folds=folds,
+            use_skew=use_skew,
+            ndcg_at=ndcg_at,
+            n_trials=n_trials,
+            seed=seed,
+        )
+        cv_best = float(study.best_value)
+
+    # Default tree, no decay
+    else:
+        cv_best, num_trees = estimate_trees_default_nodecay(
+            df_all=df,
+            folds=folds,
+            use_skew=use_skew,
+        )
+        best_tree = {
+            "depth": 6,
+            "l2_leaf_reg": 3.0,
+            "subsample": 0.5,
+            # NOTE: learning_rate not set (CatBoost chooses default)
+        }
+
+    # --- Build weights (decay or no-decay)
+    group_weight = None
+    if use_decay:
+        ref_date = df_train_final_tr["date"].max()
+        df_train_final_tr = add_query_age_days(df_train_final_tr, ref_date)
+        max_age_cap_final = int(df_train_final_tr["query_age_days"].max())
+
+        class DummyTrial:
+            def __init__(self, p): self.p = p
+            def suggest_float(self, name, *args, **kwargs): return float(self.p[name])
+
+        dummy = DummyTrial(best_decay)
+
+        # per-row, but constant within each query_id (required by CatBoost)
+        w_q_like = build_query_weights_for_trial(df_train_final_tr, dummy, max_age_cap_final)
+
+        # Make total weight per query independent of group size:
+        group_weight = row_weights_from_query_weights(df_train_final_tr, w_q_like, query_col="query_id")
+
+
+    # Train final model
+    # (CHANGE ONLY: build Pool in two explicit branches, so no-decay can never pass any weights)
+    if use_decay:
+        train_pool = Pool(
+            data=X_train_final,
+            label=y_train_final.values,
+            group_id=group_id_train_final,
+            group_weight=group_weight,
+            cat_features=cat_feature_indices,
+        )
+    else:
+        train_pool = Pool(
+            data=X_train_final,
+            label=y_train_final.values,
+            group_id=group_id_train_final,
+            cat_features=cat_feature_indices,
+        )
+
+    model_kwargs = dict(
+        loss_function="YetiRank",
+        eval_metric=cat_eval_metric,
+        boosting_type="Ordered",
+        sampling_unit="Group",
+        bootstrap_type="Bernoulli",
+        random_seed=seed,
+        task_type="CPU",
+        thread_count=thread_count,   # <--- add this
+        iterations=int(num_trees),
+        verbose=False,
+    )
+
+
+    # apply tree params
+    # (learning_rate omitted for default modes if not present)
+    if best_tree is not None:
+        for k, v in best_tree.items():
+            if k in ["depth", "learning_rate", "l2_leaf_reg", "subsample"]:
+                model_kwargs[k] = v
+
+    model = CatBoostRanker(**model_kwargs)
+
+    t_train_start = time.perf_counter()
+    model.fit(train_pool, verbose=False)
+    t_train_end = time.perf_counter()
+    train_time_seconds = float(t_train_end - t_train_start)
+    print(f"\n[{variant_sheet}] Final training time: {train_time_seconds:.3f} seconds")
+
+    OUT_ROOT = Path(f"artifacts_predict{final_test_year}")
+
+    save_catboost_variant(
+        variant_name=variant_sheet,
+        model=model,
+        out_root=OUT_ROOT,
+        final_test_year=final_test_year,
+        train_years_final=train_years_final,
+        feature_cols=present_features_final,
+        cat_feature_indices=cat_feature_indices,
+        transform_specs=(transform_specs_final if use_skew else None),
+        extra_meta={
+            "num_trees_final": int(num_trees),
+            "train_time_seconds": train_time_seconds,
+            "cv_best_mean_ndcg@10": float(cv_best) if cv_best is not None else None,
+            "use_decay": bool(use_decay),
+            "use_skew": bool(use_skew),
+            "tuned_tree": bool(tuned_tree),
+        },
+    )
+
+
+    # --- Predict + eval
+    df_test_pred, pred_time_seconds, n_races, n_riders = time_prediction_cat(
+        model=model,
+        X_test=X_test_final,
+        df_test_template=df_test_final_tr,
+        pred_col="pred",
+        model_name=variant_sheet,
+        # cat_feature_indices=cat_feature_indices,  # if you upgraded time_prediction_cat to use Pool
+    )
+
+    df_summary, metrics = evaluate_on_2024(df_test_pred, "pred", final_test_year)
+
+    # --- Optional SHAP per race (adds columns to df_summary)
+    df_summary = add_shap_per_race_catboost(
+        model=model,
+        X_test=X_test_final,
+        df_test_with_pred=df_test_pred,
+        df_race_summary=df_summary,
+        feature_names=present_features_final,
+        cat_feature_indices=cat_feature_indices,
+        k_top=10,
+    )
+
+    # --- Hyperparams + timings table (like your LightGBM style)
+    rows = []
+
+    # tree params
+    if tuned_tree:
+        for k in cat_tree_param_keys:
+            if best_tree is not None and k in best_tree:
+                rows.append({"type": "tree", "param": k, "value": best_tree[k]})
+    else:
+        # defaults we used
+        rows.append({"type": "tree", "param": "learning_rate", "value": "auto (not set)"})
+        rows.append({"type": "tree", "param": "depth",         "value": best_tree.get("depth", 6)})
+        rows.append({"type": "tree", "param": "l2_leaf_reg",   "value": best_tree.get("l2_leaf_reg", 3.0)})
+        rows.append({"type": "tree", "param": "subsample",     "value": best_tree.get("subsample", 0.5)})
+
+    # decay params
+    if use_decay:
+        for k in decay_param_keys:
+            if k in best_decay:
+                rows.append({"type": "decay", "param": k, "value": best_decay[k]})
+
+    # meta + metrics
+    rows.append({"type": "meta", "param": "use_skew",              "value": bool(use_skew)})
+    rows.append({"type": "meta", "param": "use_decay",             "value": bool(use_decay)})
+    rows.append({"type": "meta", "param": "tuned_tree",            "value": bool(tuned_tree)})
+    rows.append({"type": "meta", "param": "num_trees",             "value": int(num_trees)})
+    rows.append({"type": "meta", "param": "cv_best_mean_ndcg@10",  "value": float(cv_best) if cv_best is not None else np.nan})
+    rows.append({"type": "meta", "param": "train_time_seconds",    "value": float(train_time_seconds)})
+    rows.append({"type": "meta", "param": "pred_time_seconds",     "value": float(pred_time_seconds)})
+    rows.append({"type": "meta", "param": "pred_time_per_race",    "value": float(pred_time_seconds / n_races)})
+    rows.append({"type": "meta", "param": "pred_time_per_rider",   "value": float(pred_time_seconds / n_riders)})
+
+    if study is not None:
+        for f in folds:
+            fname = f["name"]
+            rows.append({"type": "cv", "param": f"ndcg_{fname}",  "value": float(study.best_trial.user_attrs.get(f"ndcg_{fname}", np.nan))})
+            rows.append({"type": "cv", "param": f"trees_{fname}", "value": float(study.best_trial.user_attrs.get(f"trees_{fname}", np.nan))})
+
+    for mk, mv in metrics.items():
+        rows.append({"type": "metric", "param": mk, "value": mv})
+
+    df_hparams = pd.DataFrame(rows)
+
+    return df_summary, df_hparams
+
+
+# %% Run selected variants (8)
+
+summaries = {}
+hparams = {}
+
+# ---- SKEW
+if RUN_CAT_TUNED_DECAY_SKEW:
+    k = "catboost_tuned_decay_skew"
+    summaries[k], hparams[k] = run_variant(k, use_skew=True, tuned_tree=True,  use_decay=True)
+
+if RUN_CAT_DEFAULT_DECAY_SKEW:
+    k = "catboost_def_decay_skew"
+    summaries[k], hparams[k] = run_variant(k, use_skew=True, tuned_tree=False, use_decay=True)
+
+if RUN_CAT_TUNED_NODECAY_SKEW:
+    k = "catboost_tuned_nodecay_skew"
+    summaries[k], hparams[k] = run_variant(k, use_skew=True, tuned_tree=True,  use_decay=False)
+
+if RUN_CAT_DEFAULT_NODECAY_SKEW:
+    k = "catboost_def_nodecay_skew"
+    summaries[k], hparams[k] = run_variant(k, use_skew=True, tuned_tree=False, use_decay=False)
+
+# ---- NO SKEW
+if RUN_CAT_TUNED_DECAY_NOSKEW:
+    k = "catboost_tuned_decay_noskew"
+    summaries[k], hparams[k] = run_variant(k, use_skew=False, tuned_tree=True,  use_decay=True)
+
+if RUN_CAT_DEFAULT_DECAY_NOSKEW:
+    k = "catboost_def_decay_noskew"
+    summaries[k], hparams[k] = run_variant(k, use_skew=False, tuned_tree=False, use_decay=True)
+
+if RUN_CAT_TUNED_NODECAY_NOSKEW:
+    k = "catboost_tuned_nodecay_noskew"
+    summaries[k], hparams[k] = run_variant(k, use_skew=False, tuned_tree=True,  use_decay=False)
+
+if RUN_CAT_DEFAULT_NODECAY_NOSKEW:
+    k = "catboost_def_nodecay_noskew"
+    summaries[k], hparams[k] = run_variant(k, use_skew=False, tuned_tree=False, use_decay=False)
+
+
+# %% Write per-race summaries for all CatBoost models (same style)
+
+if len(summaries) > 0:
+    with pd.ExcelWriter("race_summaries_catboost_2024.xlsx") as writer:
+        for sheet, df_sum in summaries.items():
+            df_sum.to_excel(writer, sheet_name=sheet[:31], index=False)
+    print("\nrace_summaries_catboost_2024.xlsx has been written (for models that were run).")
+else:
+    print("\nNo CatBoost variants were run; race_summaries_catboost_2024.xlsx not written.")
+
+
+# %% Write CatBoost hyperparameters + timings (same style)
+
+if len(hparams) > 0:
+    with pd.ExcelWriter("hyperparameters_catboost_2024.xlsx") as writer:
+        for sheet, df_hp in hparams.items():
+            df_hp.to_excel(writer, sheet_name=sheet[:31], index=False)
+    print("\nhyperparameters_catboost_2024.xlsx has been written (for models that were run).")
+else:
+    print("\nNo CatBoost variants were run; hyperparameters_catboost_2024.xlsx not written.")
+
+
+# %% Append CatBoost summaries to all-models Excel (same style)
+
+all_summaries_path = "race_summaries_all_models_2024.xlsx"
+
+if len(summaries) > 0:
+    if os.path.exists(all_summaries_path):
+        mode = "a"
+        engine_kwargs = {"if_sheet_exists": "replace"}
+    else:
+        mode = "w"
+        engine_kwargs = {}
+
+    with pd.ExcelWriter(all_summaries_path, engine="openpyxl", mode=mode, **engine_kwargs) as writer:
+        for sheet, df_sum in summaries.items():
+            df_sum.to_excel(writer, sheet_name=sheet[:31], index=False)
+
+    print("\nCatBoost race summaries have been added to race_summaries_all_models_2024.xlsx.")
+else:
+    print("\nNo CatBoost variants were run; nothing appended to race_summaries_all_models_2024.xlsx.")
+
+
+# %% Append CatBoost hyperparameters to all-models Excel (same style)
+
+hyper_all_path = "hyperparameters_all_models_2024.xlsx"
+
+if len(hparams) > 0:
+    if os.path.exists(hyper_all_path):
+        mode = "a"
+        engine_kwargs = {"if_sheet_exists": "replace"}
+    else:
+        mode = "w"
+        engine_kwargs = {}
+
+    with pd.ExcelWriter(hyper_all_path, engine="openpyxl", mode=mode, **engine_kwargs) as writer:
+        for sheet, df_hp in hparams.items():
+            df_hp.to_excel(writer, sheet_name=sheet[:31], index=False)
+
+    print("\nCatBoost hyperparameters have been added to hyperparameters_all_models_2024.xlsx.")
+else:
+    print("\nNo CatBoost variants were run; nothing appended to hyperparameters_all_models_2024.xlsx.")
