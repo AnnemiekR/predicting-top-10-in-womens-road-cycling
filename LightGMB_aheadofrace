@@ -123,14 +123,7 @@ numeric_features = [
 # Minimal, common transform set:
 #   - identity
 #   - log1p          (for nonnegative heavy right-skew)
-#   - log1p_shifted  (for heavy right-skew with negatives)
 #   - yeo-johnson    (general fallback, works with negatives)
-#
-# Policy:
-#   1) If abs(skew) <= skew_threshold -> identity (do nothing)
-#   2) Otherwise try candidates and pick the one with smallest abs(skew)
-#   3) Accept if it improves abs(skew) by at least min_rel_improve
-#      (even if skew is still > threshold)
 # ============================================================
 
 def fit_auto_skew_transforms(
@@ -212,7 +205,7 @@ def fit_auto_skew_transforms(
         min_val = float(np.nanmin(xv[finite_mask]))
 
         # ----------------------------
-        # Stage 1: log1p ONLY (no shift)
+        # Stage 1: log1p ONLY 
         # ----------------------------
         log_evals: List[Tuple[str, Dict[str, Any], float]] = []
 
