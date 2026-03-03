@@ -10,7 +10,9 @@ This repository accompanies:
 Roete, AJ. (???). *TITLE*. JOURNAL/CONFERENCE. https://doi.org/10.xxxx/xxxxx
 
 ## How to cite
-If you use this repository, please cite the publication above.
+If you use this repository, please cite the publication:
+Roete, AJ. (???). *TITLE*. JOURNAL/CONFERENCE. https://doi.org/10.xxxx/xxxxx
+
 
 If you also want to cite the software itself, you can use GitHub’s **“Cite this repository”** feature (see `CITATION.cff` if included).
 
