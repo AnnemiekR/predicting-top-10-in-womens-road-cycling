@@ -550,17 +550,36 @@ def summarize_shap_topk_and_all(
     }
 
 # %% Evaluation on 2024
-
 def evaluate_on_2024(df_test_with_pred: pd.DataFrame, pred_col: str, k_top: int = 10):
     df_eval = df_test_with_pred.copy()
 
-    df_eval["actual_rank"] = df_eval.groupby(query_col)[result_col].rank(method="min", ascending=True)
-    df_eval["predicted_rank"] = df_eval.groupby(query_col)[pred_col].rank(method="first", ascending=False)
+    # numeric safety
+    df_eval[result_col] = pd.to_numeric(df_eval[result_col], errors="coerce")
+    df_eval[pred_col] = pd.to_numeric(df_eval[pred_col], errors="coerce")
+
+    # remove unusable rows
+    df_eval = df_eval[
+        df_eval[result_col].notna() & df_eval[pred_col].notna()
+    ].copy()
+
+    # full-field ranks
+    df_eval["actual_rank"] = (
+        df_eval.groupby(query_col)[result_col]
+        .rank(method="min", ascending=True)
+    )
+    df_eval["predicted_rank"] = (
+        df_eval.groupby(query_col)[pred_col]
+        .rank(method="first", ascending=False)
+    )
 
     summary_rows = []
+
     for qid, g in df_eval.groupby(query_col, sort=False):
         g = g.copy()
         n_riders = len(g)
+
+        if n_riders <= 1:
+            continue
 
         g_actual = g.sort_values(result_col, ascending=True)
         g_pred = g.sort_values(pred_col, ascending=False)
@@ -578,65 +597,68 @@ def evaluate_on_2024(df_test_with_pred: pd.DataFrame, pred_col: str, k_top: int 
             row[f"actual_rank_{i+1}"] = actual_names[i] if i < len(actual_names) else np.nan
             row[f"pred_rank_{i+1}"] = pred_names[i] if i < len(pred_names) else np.nan
 
-        if n_riders > 1:
-            # Focus set: PREDICTED top-k riders only
-            focus_idx = g_pred.index[:k_eff]
-            g_focus = g.loc[focus_idx]
+        # NDCG@k on full field
+        labels_q = g[label_col].astype(int).values
+        scores_q = g[pred_col].astype(float).values
+        row["ndcg@10"] = ndcg_at_k_labels_scores(
+            labels_q, scores_q, k=k_eff, label_gain=label_gain
+        )
 
-            # Graded relevance (MATCHES TRAINING/CV) for NDCG@k
-            labels_q = g[label_col].astype(int).values          # rel_grade_0_31
-            scores_q = g[pred_col].astype(float).values
+        # Actual top-k riders
+        focus_idx = g_actual.index[:k_eff]
+        g_focus = g.loc[focus_idx].copy()
 
-            row["ndcg@10"] = ndcg_at_k_labels_scores(
-                labels_q, scores_q, k=k_eff, label_gain=label_gain
-            )
-
-            # Spearman/MAE/RMSE on PREDICTED top-k riders only
-            if g_focus["predicted_rank"].nunique() > 1 and g_focus["actual_rank"].nunique() > 1:
-                rho = spearmanr(g_focus["predicted_rank"], g_focus["actual_rank"]).correlation
-                row["spearman_rho"] = float(rho) if np.isfinite(rho) else np.nan
-            else:
-                row["spearman_rho"] = np.nan
-
-            row["mae_rank"] = float(mean_absolute_error(g_focus["actual_rank"], g_focus["predicted_rank"]))
-            row["rmse_rank"] = float(np.sqrt(mean_squared_error(g_focus["actual_rank"], g_focus["predicted_rank"])))
-
-            # Top-3 accuracy (podium overlap proportion) 
-            k3 = 3
-            if n_riders >= k3:
-                true_top3_idx = set(g_actual.index[:k3])
-                pred_top3_idx = set(g_pred.index[:k3])
-                row["top3_accuracy"] = len(true_top3_idx & pred_top3_idx) / k3
-            else:
-                row["top3_accuracy"] = np.nan
-
-            # Precision@10 overlap
-            true_top_idx = set(g_actual.index[:k_eff])
-            pred_top_idx = set(g_pred.index[:k_eff])
-            row["precision@10"] = len(true_top_idx & pred_top_idx) / k_eff
+        # Spearman / MAE / RMSE on actual top-k riders
+        if g_focus["predicted_rank"].nunique() > 1 and g_focus["actual_rank"].nunique() > 1:
+            rho = spearmanr(g_focus["predicted_rank"], g_focus["actual_rank"]).correlation
+            row["spearman_rho"] = float(rho) if np.isfinite(rho) else np.nan
         else:
-            row["ndcg@10"] = np.nan
             row["spearman_rho"] = np.nan
-            row["mae_rank"] = np.nan
+
+        row["mae_rank"] = float(
+            mean_absolute_error(
+                g_focus["actual_rank"],
+                g_focus["predicted_rank"]
+            )
+        )
+
+        row["rmse_rank"] = float(
+            np.sqrt(
+                mean_squared_error(
+                    g_focus["actual_rank"],
+                    g_focus["predicted_rank"]
+                )
+            )
+        )
+
+        # Top-3 accuracy
+        k3 = 3
+        if n_riders >= k3:
+            true_top3_idx = set(g_actual.index[:k3])
+            pred_top3_idx = set(g_pred.index[:k3])
+            row["top3_accuracy"] = len(true_top3_idx & pred_top3_idx) / k3
+        else:
             row["top3_accuracy"] = np.nan
-            row["precision@10"] = np.nan
-            row["rmse_rank"] = np.nan
+
+        # Precision@10 overlap
+        true_top_idx = set(g_actual.index[:k_eff])
+        pred_top_idx = set(g_pred.index[:k_eff])
+        row["precision@10"] = len(true_top_idx & pred_top_idx) / k_eff if k_eff > 0 else np.nan
 
         summary_rows.append(row)
 
     df_summary = pd.DataFrame(summary_rows)
 
     metrics = {
-        "mean_ndcg@10": float(df_summary["ndcg@10"].mean(skipna=True)),
-        "mean_spearman_rho": float(df_summary["spearman_rho"].mean(skipna=True)),
-        "mean_mae_rank": float(df_summary["mae_rank"].mean(skipna=True)),
-        "mean_top3_accuracy": float(df_summary["top3_accuracy"].mean(skipna=True)),
-        "mean_precision@10": float(df_summary["precision@10"].mean(skipna=True)),
-        "mean_rmse_rank": float(df_summary["rmse_rank"].mean(skipna=True)),
+        "mean_ndcg@10": float(df_summary["ndcg@10"].mean(skipna=True)) if not df_summary.empty else np.nan,
+        "mean_spearman_rho": float(df_summary["spearman_rho"].mean(skipna=True)) if not df_summary.empty else np.nan,
+        "mean_mae_rank": float(df_summary["mae_rank"].mean(skipna=True)) if not df_summary.empty else np.nan,
+        "mean_top3_accuracy": float(df_summary["top3_accuracy"].mean(skipna=True)) if not df_summary.empty else np.nan,
+        "mean_precision@10": float(df_summary["precision@10"].mean(skipna=True)) if not df_summary.empty else np.nan,
+        "mean_rmse_rank": float(df_summary["rmse_rank"].mean(skipna=True)) if not df_summary.empty else np.nan,
     }
 
     return df_summary, metrics
-
 
 # %% Timer
 
