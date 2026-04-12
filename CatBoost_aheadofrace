@@ -480,18 +480,39 @@ def json_default(o):
     raise TypeError(f"Object of type {type(o).__name__} is not JSON serializable")
 
 
-# %% Per-race evaluation helper (same output style as your LightGBM)
+# %% Per-race evaluation helper 
 
 def evaluate_on_2024(df_test_with_pred: pd.DataFrame, pred_col: str, final_test_year: int, k_top: int = 10):
     df_eval = df_test_with_pred.copy()
 
-    df_eval["actual_rank"] = df_eval.groupby("query_id")["result"].rank(method="min", ascending=True)
-    df_eval["predicted_rank"] = df_eval.groupby("query_id")[pred_col].rank(method="first", ascending=False)
+    # --- safety: ensure numeric ---
+    df_eval["result"] = pd.to_numeric(df_eval["result"], errors="coerce")
+    df_eval[pred_col] = pd.to_numeric(df_eval[pred_col], errors="coerce")
+
+    # drop bad rows
+    df_eval = df_eval[
+        df_eval["result"].notna() & df_eval[pred_col].notna()
+    ].copy()
+
+    # --- ranks ---
+    df_eval["actual_rank"] = (
+        df_eval.groupby("query_id")["result"]
+        .rank(method="min", ascending=True)
+    )
+
+    df_eval["predicted_rank"] = (
+        df_eval.groupby("query_id")[pred_col]
+        .rank(method="first", ascending=False)
+    )
 
     summary_rows = []
+
     for qid, g in df_eval.groupby("query_id", sort=False):
         g = g.copy()
         n_riders = len(g)
+
+        if n_riders <= 1:
+            continue
 
         g_actual = g.sort_values("result", ascending=True)
         g_pred   = g.sort_values(pred_col, ascending=False)
@@ -502,6 +523,7 @@ def evaluate_on_2024(df_test_with_pred: pd.DataFrame, pred_col: str, final_test_
         pred_names   = g_pred["name"].tolist()[:k_eff]
 
         row = {"query_id": qid, "n_riders": n_riders}
+
         if "race_profile" in g.columns:
             row["race_profile"] = g["race_profile"].iloc[0]
 
@@ -509,59 +531,85 @@ def evaluate_on_2024(df_test_with_pred: pd.DataFrame, pred_col: str, final_test_
             row[f"actual_rank_{i+1}"] = actual_names[i] if i < len(actual_names) else np.nan
             row[f"pred_rank_{i+1}"]   = pred_names[i]   if i < len(pred_names)   else np.nan
 
-        if n_riders > 1:
-            # NDCG on full field (matches your XGB evaluation)
-            labels_q = g["rel_grade_0_31"].astype(int).values
-            scores_q = g[pred_col].astype(float).values
-            row["ndcg@10"] = ndcg_at_k_labels_scores(labels_q, scores_q, k=k_eff, label_gain=label_gain)
+        # --- NDCG ---
+        labels_q = g["rel_grade_0_31"].astype(int).values
+        scores_q = g[pred_col].astype(float).values
 
-            # Focus set = predicted top-k only (matches your XGB evaluation)
-            focus_idx = g_pred.index[:k_eff]
-            g_focus = g.loc[focus_idx]
+        row["ndcg@10"] = ndcg_at_k_labels_scores(
+            labels_q, scores_q, k=k_eff, label_gain=label_gain
+        )
+        focus_idx = g_actual.index[:k_eff]
+        g_focus = g.loc[focus_idx].copy()
 
-            if g_focus["predicted_rank"].nunique() > 1 and g_focus["actual_rank"].nunique() > 1:
-                rho = spearmanr(g_focus["predicted_rank"], g_focus["actual_rank"]).correlation
-                row["spearman_rho"] = float(rho) if np.isfinite(rho) else np.nan
-            else:
-                row["spearman_rho"] = np.nan
-
-            row["mae_rank"] = float(mean_absolute_error(g_focus["actual_rank"], g_focus["predicted_rank"]))
-            row["rmse_rank"] = float(np.sqrt(mean_squared_error(g_focus["actual_rank"], g_focus["predicted_rank"])))
-
-
-            # Top-3 overlap proportion (matches your XGB evaluation)
-            k3 = 3
-            if n_riders >= k3:
-                true_top3_idx = set(g_actual.index[:k3])
-                pred_top3_idx = set(g_pred.index[:k3])
-                row["top3_accuracy"] = len(true_top3_idx & pred_top3_idx) / k3
-            else:
-                row["top3_accuracy"] = np.nan
-
-            # Precision@10 overlap (same as XGB)
-            true_top_idx = set(g_actual.index[:k_eff])
-            pred_top_idx = set(g_pred.index[:k_eff])
-            row["precision@10"] = len(true_top_idx & pred_top_idx) / k_eff
+        # --- Spearman ---
+        if (
+            g_focus["predicted_rank"].nunique() > 1 and
+            g_focus["actual_rank"].nunique() > 1
+        ):
+            rho = spearmanr(
+                g_focus["predicted_rank"],
+                g_focus["actual_rank"]
+            ).correlation
+            row["spearman_rho"] = float(rho) if np.isfinite(rho) else np.nan
         else:
-            row["ndcg@10"] = np.nan
             row["spearman_rho"] = np.nan
-            row["mae_rank"] = np.nan
-            row["rmse_rank"] = np.nan
+
+        # --- MAE / RMSE ---
+        row["mae_rank"] = float(
+            mean_absolute_error(
+                g_focus["actual_rank"],
+                g_focus["predicted_rank"]
+            )
+        )
+
+        row["rmse_rank"] = float(
+            np.sqrt(
+                mean_squared_error(
+                    g_focus["actual_rank"],
+                    g_focus["predicted_rank"]
+                )
+            )
+        )
+
+        # --- Top-3 overlap ---
+        k3 = 3
+        if n_riders >= k3:
+            true_top3_idx = set(g_actual.index[:k3])
+            pred_top3_idx = set(g_pred.index[:k3])
+            row["top3_accuracy"] = len(true_top3_idx & pred_top3_idx) / k3
+        else:
             row["top3_accuracy"] = np.nan
-            row["precision@10"] = np.nan
+
+        # --- Precision@k ---
+        true_top_idx = set(g_actual.index[:k_eff])
+        pred_top_idx = set(g_pred.index[:k_eff])
+        row["precision@10"] = (
+            len(true_top_idx & pred_top_idx) / k_eff if k_eff > 0 else np.nan
+        )
 
         summary_rows.append(row)
 
     df_summary = pd.DataFrame(summary_rows)
 
-    metrics = {
-        "mean_ndcg@10": float(df_summary["ndcg@10"].mean(skipna=True)),
-        "mean_spearman_rho": float(df_summary["spearman_rho"].mean(skipna=True)),
-        "mean_mae_rank": float(df_summary["mae_rank"].mean(skipna=True)),
-        "mean_rmse_rank": float(df_summary["rmse_rank"].mean(skipna=True)),
-        "mean_top3_accuracy": float(df_summary["top3_accuracy"].mean(skipna=True)),
-        "mean_precision@10": float(df_summary["precision@10"].mean(skipna=True)),
-    }
+    # --- safe aggregation ---
+    if df_summary.empty:
+        metrics = {
+            "mean_ndcg@10": np.nan,
+            "mean_spearman_rho": np.nan,
+            "mean_mae_rank": np.nan,
+            "mean_rmse_rank": np.nan,
+            "mean_top3_accuracy": np.nan,
+            "mean_precision@10": np.nan,
+        }
+    else:
+        metrics = {
+            "mean_ndcg@10": float(df_summary["ndcg@10"].mean(skipna=True)),
+            "mean_spearman_rho": float(df_summary["spearman_rho"].mean(skipna=True)),
+            "mean_mae_rank": float(df_summary["mae_rank"].mean(skipna=True)),
+            "mean_rmse_rank": float(df_summary["rmse_rank"].mean(skipna=True)),
+            "mean_top3_accuracy": float(df_summary["top3_accuracy"].mean(skipna=True)),
+            "mean_precision@10": float(df_summary["precision@10"].mean(skipna=True)),
+        }
 
     print(f"\nFinal hold-out year {final_test_year} (per-race averages) — model: {pred_col}")
     for k, v in metrics.items():
