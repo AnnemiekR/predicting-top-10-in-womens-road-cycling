@@ -1725,13 +1725,22 @@ def tune_lgbm_rank_optuna_cv_nodecay_noskew(
 def evaluate_on_2024(df_test_final_tr, pred_col: str, final_test_year: int, k_top: int = 10):
     """
     Per-race evaluation on hold-out year.
-    - NDCG@k, Precision@k, Top-3 accuracy computed in the usual way (full field).
-    - Spearman/MAE/RMSE computed on PREDICTED top-k riders only (XGBoost-style).
-      predicted_rank is still computed over the full field.
+    - NDCG@k, Precision@k, Top-3 accuracy computed on the full field.
+    - Spearman/MAE/RMSE computed on the actual top-k riders only.
+    - predicted_rank is still computed over the full field.
     """
     df_eval_2024 = df_test_final_tr.copy()
 
-    # Actual rank: 1 = winner (lowest result)
+    # numeric safety
+    df_eval_2024["result"] = pd.to_numeric(df_eval_2024["result"], errors="coerce")
+    df_eval_2024[pred_col] = pd.to_numeric(df_eval_2024[pred_col], errors="coerce")
+
+    # remove rows with missing result or prediction
+    df_eval_2024 = df_eval_2024[
+        df_eval_2024["result"].notna() & df_eval_2024[pred_col].notna()
+    ].copy()
+
+    # Actual rank: 1 = winner
     df_eval_2024["actual_rank"] = (
         df_eval_2024.groupby("query_id")["result"]
         .rank(method="min", ascending=True)
@@ -1749,6 +1758,9 @@ def evaluate_on_2024(df_test_final_tr, pred_col: str, final_test_year: int, k_to
         g = g.copy()
         n_riders = len(g)
 
+        if n_riders <= 1:
+            continue
+
         g_actual = g.sort_values("result", ascending=True)
         g_pred   = g.sort_values(pred_col, ascending=False)
 
@@ -1757,91 +1769,85 @@ def evaluate_on_2024(df_test_final_tr, pred_col: str, final_test_year: int, k_to
             "n_riders": n_riders,
         }
 
-        # include race_profile in the per-race summary (if available)
         if "race_profile" in g.columns:
             row["race_profile"] = g["race_profile"].iloc[0]
 
-        # lists of names for the sheet
         k_eff = min(k_top, n_riders)
+
         actual_names = g_actual["name"].tolist()[:k_eff]
         pred_names   = g_pred["name"].tolist()[:k_eff]
 
         for i in range(k_top):
             row[f"actual_rank_{i+1}"] = actual_names[i] if i < len(actual_names) else np.nan
-            row[f"pred_rank_{i+1}"]   = pred_names[i]   if i < len(pred_names)   else np.nan
+            row[f"pred_rank_{i+1}"]   = pred_names[i] if i < len(pred_names) else np.nan
 
-        if n_riders > 1:
-            # --- NDCG@k (query-wise, full field) ---
+        # --- NDCG@k (full field) ---
+        if "rel_grade_0_31" in g.columns:
             labels_q = g["rel_grade_0_31"].astype(int).values
             scores_q = g[pred_col].astype(float).values
-            row["ndcg@10"] = ndcg_at_k_labels_scores(labels_q, scores_q, k=k_eff, label_gain=label_gain)
+            row["ndcg@10"] = ndcg_at_k_labels_scores(
+                labels_q, scores_q, k=k_eff, label_gain=label_gain
+            )
+        else:
+            row["ndcg@10"] = np.nan
 
-            # --- Focus subset: PREDICTED top-k riders only (Option B) ---
-            focus_idx = g_pred.index[:k_eff]
-            g_focus = g.loc[focus_idx].copy()
+        # --- Focus subset: ACTUAL top-k riders ---
+        focus_idx = g_actual.index[:k_eff]
+        g_focus = g.loc[focus_idx].copy()
 
-            # Spearman on PREDICTED top-k
-            if g_focus["predicted_rank"].nunique() > 1 and g_focus["actual_rank"].nunique() > 1:
-                rho = spearmanr(g_focus["predicted_rank"], g_focus["actual_rank"]).correlation
-                row["spearman_rho"] = float(rho) if np.isfinite(rho) else np.nan
-            else:
-                row["spearman_rho"] = np.nan
+        # Spearman on ACTUAL top-k
+        if g_focus["predicted_rank"].nunique() > 1 and g_focus["actual_rank"].nunique() > 1:
+            rho = spearmanr(g_focus["predicted_rank"], g_focus["actual_rank"]).correlation
+            row["spearman_rho"] = float(rho) if np.isfinite(rho) else np.nan
+        else:
+            row["spearman_rho"] = np.nan
 
-            # MAE/RMSE on PREDICTED top-k
-            row["mae_rank"] = float(
-                mean_absolute_error(
+        # MAE / RMSE on ACTUAL top-k
+        row["mae_rank"] = float(
+            mean_absolute_error(
+                g_focus["actual_rank"].values,
+                g_focus["predicted_rank"].values,
+            )
+        )
+
+        row["rmse_rank"] = float(
+            np.sqrt(
+                mean_squared_error(
                     g_focus["actual_rank"].values,
                     g_focus["predicted_rank"].values,
                 )
             )
+        )
 
-            row["rmse_rank"] = float(
-                np.sqrt(
-                    mean_squared_error(
-                        g_focus["actual_rank"].values,
-                        g_focus["predicted_rank"].values,
-                    )
-                )
-            )
-
-            # ---- Top-3 accuracy (podium overlap proportion) ----
-            k3 = 3
-            if n_riders >= k3:
-                true_top3_idx = set(g_actual.index[:k3])
-                pred_top3_idx = set(g_pred.index[:k3])
-                row["top3_accuracy"] = len(true_top3_idx & pred_top3_idx) / k3
-            else:
-                row["top3_accuracy"] = np.nan
-
-            # Precision@k (overlap of rider identities in top-k)
-            true_top_idx = set(g_actual.index[:k_eff])
-            pred_top_idx = set(g_pred.index[:k_eff])
-            row["precision@10"] = len(true_top_idx & pred_top_idx) / k_eff
-
+        # --- Top-3 accuracy ---
+        k3 = min(3, n_riders)
+        if k3 == 3:
+            true_top3_idx = set(g_actual.index[:k3])
+            pred_top3_idx = set(g_pred.index[:k3])
+            row["top3_accuracy"] = len(true_top3_idx & pred_top3_idx) / k3
         else:
-            row["ndcg@10"]       = np.nan
-            row["spearman_rho"]  = np.nan
-            row["mae_rank"]      = np.nan
-            row["rmse_rank"]     = np.nan
             row["top3_accuracy"] = np.nan
-            row["precision@10"]  = np.nan
+
+        # --- Precision@10 ---
+        true_top_idx = set(g_actual.index[:k_eff])
+        pred_top_idx = set(g_pred.index[:k_eff])
+        row["precision@10"] = len(true_top_idx & pred_top_idx) / k_eff if k_eff > 0 else np.nan
 
         summary_rows.append(row)
 
     df_race_summary_2024 = pd.DataFrame(summary_rows)
 
-    # Optional: move race_profile to be right after query_id
     if "race_profile" in df_race_summary_2024.columns:
         cols = df_race_summary_2024.columns.tolist()
         cols.insert(cols.index("query_id") + 1, cols.pop(cols.index("race_profile")))
         df_race_summary_2024 = df_race_summary_2024[cols]
 
-    mean_ndcg  = df_race_summary_2024["ndcg@10"].mean(skipna=True)
-    mean_rho   = df_race_summary_2024["spearman_rho"].mean(skipna=True)
-    mean_mae   = df_race_summary_2024["mae_rank"].mean(skipna=True)
-    mean_rmse  = df_race_summary_2024["rmse_rank"].mean(skipna=True)
-    mean_top3  = df_race_summary_2024["top3_accuracy"].mean(skipna=True)
-    mean_prec  = df_race_summary_2024["precision@10"].mean(skipna=True)
+    mean_ndcg  = df_race_summary_2024["ndcg@10"].mean(skipna=True) if not df_race_summary_2024.empty else np.nan
+    mean_rho   = df_race_summary_2024["spearman_rho"].mean(skipna=True) if not df_race_summary_2024.empty else np.nan
+    mean_mae   = df_race_summary_2024["mae_rank"].mean(skipna=True) if not df_race_summary_2024.empty else np.nan
+    mean_rmse  = df_race_summary_2024["rmse_rank"].mean(skipna=True) if not df_race_summary_2024.empty else np.nan
+    mean_top3  = df_race_summary_2024["top3_accuracy"].mean(skipna=True) if not df_race_summary_2024.empty else np.nan
+    mean_prec  = df_race_summary_2024["precision@10"].mean(skipna=True) if not df_race_summary_2024.empty else np.nan
 
     print(f"\nFinal hold-out year {final_test_year} (per-race averages) — model: {pred_col}")
     print(f"  Mean ndcg@10           = {mean_ndcg:.4f}")
@@ -1859,7 +1865,6 @@ def evaluate_on_2024(df_test_final_tr, pred_col: str, final_test_year: int, k_to
         "mean_top3_accuracy":  mean_top3,
         "mean_precision@10":   mean_prec,
     }
-
 
 # %% Final 2019–2023 train / 2024 test transforms (shared)
 
